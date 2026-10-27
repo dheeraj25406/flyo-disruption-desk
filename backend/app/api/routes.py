@@ -10,8 +10,8 @@ from app.schemas.cases import (
 )
 from app.schemas.flight_alert import FlightAlert
 from app.schemas.copilot import (
-    AskCopilotRequest, CompareAlternativesRequest, CopilotAnalysisResponse,
-    CopilotAskResponse, CopilotComparisonResponse,
+    AgentRunRequest, AgentRunResponse, AskCopilotRequest, CompareAlternativesRequest,
+    CopilotAnalysisResponse, CopilotAskResponse, CopilotComparisonResponse,
 )
 from app.services.actions import (
     ActionEligibilityError, ActionIdempotencyConflict, InvalidActionTransition,
@@ -19,6 +19,7 @@ from app.services.actions import (
 )
 from app.services.copilot import build_case_context, draft_case_message
 from app.services.disruptions import UnknownFlightError, process_cancellation
+from app.services.agent import run_case_agent
 from app.services.recovery import evaluate_case
 
 router = APIRouter()
@@ -225,6 +226,27 @@ def ask_case(case_id: int, body: AskCopilotRequest, request: Request, session: S
     case, context = _copilot_case_context(session, case_id)
     result = request.app.state.copilot_provider.answer(context, body.question)
     _audit_copilot(session, case, "copilot_question_answered", result)
+    session.commit()
+    return result
+
+
+@router.post("/cases/{case_id}/agent/run", response_model=AgentRunResponse)
+def run_recovery_agent(
+    case_id: int,
+    body: AgentRunRequest,
+    request: Request,
+    session: Session = Depends(get_session),
+):
+    case = session.get(DisruptionCase, case_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail=f"Case not found: {case_id}")
+    booking = session.get(Booking, case.booking_id)
+    if booking is None:
+        raise HTTPException(status_code=404, detail="Booking associated with case was not found")
+    result = run_case_agent(
+        session, case, booking, request.app.state.copilot_provider,
+        body.objective, body.allow_proposal,
+    )
     session.commit()
     return result
 

@@ -49,7 +49,15 @@ Generate a case summary and passenger-message draft:
 
     curl -X POST http://127.0.0.1:8000/cases/1/draft-message
 
-The provider-independent CopilotProvider interface currently uses DeterministicCopilot, which needs no API key or external LLM SDK. The endpoint records that it generated a draft; it never sends it. A SEND_MESSAGE action can only be proposed from a saved draft and requires its own explicit approval before the simulator records a delivery outcome.
+Run the bounded agent workflow (proposing is disabled unless explicitly enabled in this request):
+
+    curl -X POST http://127.0.0.1:8000/cases/1/agent/run \
+      -H 'Content-Type: application/json' \
+      -d '{"objective":"Review simulated recovery options","allow_proposal":false}'
+
+The agent can search the persisted synthetic policy results, read the deterministic connection assessment, compare eligible alternatives in policy order, and request a rebooking proposal when `allow_proposal` is true. It cannot approve, reject, or execute actions. Proposals remain pending human approval. Tool arguments and names are allowlisted and validated; the backend executes tools, never SDK automatic execution. Gemini is limited to four tool calls and four turns. Missing keys or provider/tool failures use deterministic fallback behavior.
+
+The provider-independent CopilotProvider supports the configured Gemini model when a backend API key is present and otherwise uses DeterministicCopilot. The draft endpoint records that it generated a draft; it never sends it. A SEND_MESSAGE action can only be proposed from a saved draft and requires its own explicit approval before the simulator records a delivery outcome.
 
 ## Action and decision behavior
 

@@ -65,10 +65,16 @@ Open the Vite URL shown in the terminal (normally http://localhost:5173). The de
 - Gemini uses Google's official `google-genai` Python SDK (`google-genai==1.47.0`, compatible with Python 3.9) and the exact model ID `gemini-3.5-flash-lite`. No other model is used as a fallback.
 - Gemini receives a minimal case context through structured-output requests. Responses are validated with Pydantic and evidence references are checked against the exact context supplied. Invalid output, unsupported draft claims, missing keys, timeouts, quota errors, and provider errors use deterministic responses with explicit metadata.
 - Passenger names are sent only for message drafting; draft context excludes itinerary risk details, candidate scores, and internal policy reason codes. Copilot prompts and questions are not stored in audit records. Audit records store operation and provider metadata.
-- Analysis, comparison, Q&A, and draft endpoints have no action-execution tools. Proposals still use the existing explicit human approval workflow. Message drafts are labeled unsent and are not delivered.
+- Analysis, comparison, Q&A, and draft endpoints have no action tools. The bounded agent can request only an eligible simulated rebooking proposal when the request explicitly sets `allow_proposal` to true. Proposals still use the existing separate human approval workflow; no copilot endpoint approves or executes. Message drafts are labeled unsent and are not delivered.
 - Without `GEMINI_API_KEY`, fallback responses provide simpler case-grounded summaries and conservative answers. Fallback output is never labeled as a Gemini response.
 
 Copilot API routes are `POST /cases/{case_id}/copilot/analyze`, `POST /cases/{case_id}/copilot/compare` (JSON body `{ "alternative_ids": ["SIM-001"] }`), `POST /cases/{case_id}/copilot/ask` (JSON body `{ "question": "..." }`), and the existing `POST /cases/{case_id}/draft-message`. Each response includes provider, model when applicable, fallback status, and validation status. Compare requests accept only inventory IDs in the case's latest persisted eligible decision.
+
+### Bounded recovery agent
+
+`POST /cases/{case_id}/agent/run` accepts `{"objective":"Review options","allow_proposal":false}`. The backend may use Gemini function calling with a fixed allowlist: search persisted synthetic alternatives, check persisted connection assessments, compare eligible alternatives in deterministic policy rank order, and (only when `allow_proposal` is explicitly true) propose a simulated rebooking through the existing action service. The agent is limited to four tool calls and four model turns; tool arguments are validated and SDK automatic function execution is disabled. An evaluation is persisted first if the case has none.
+
+The agent cannot approve, reject, or execute actions. A proposal remains `PENDING_APPROVAL` and requires the existing separate human approval endpoint. Tool results are generated from the stored policy decision and synthetic inventory, not model-supplied flight facts. With no Gemini key or on provider/validation failure, a deterministic summary and read-only tool results are returned; fallback mode never creates proposals.
 
 ### Testing Gemini
 
@@ -98,7 +104,7 @@ Backend tests (temporary SQLite databases):
     cd backend
     python3 -m pytest -v
 
-The suite currently has 54 passing unit tests and uses mocked Gemini clients; it does not make external API requests.
+The suite currently has 64 passing unit tests and uses mocked Gemini clients; it does not make external API requests.
 
 Deterministic reliability evaluation:
 
