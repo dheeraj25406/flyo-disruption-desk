@@ -241,6 +241,122 @@ def test_compare_tool_returns_requested_options_in_policy_order(tmp_path):
         close(client)
 
 
+def test_gemini_multiple_calls_preserve_signed_candidate_and_final_text(
+    tmp_path, caplog,
+):
+    class Models:
+        def __init__(self, responses):
+            self.responses = iter(responses)
+            self.requests = []
+
+        def generate_content(self, **kwargs):
+            self.requests.append(kwargs)
+            return next(self.responses)
+
+    model_content = types.Content(
+        role="model",
+        parts=[
+            types.Part(
+                function_call=types.FunctionCall(
+                    name="search_synthetic_alternatives", args={},
+                ),
+                thought_signature=b"opaque-thought-signature",
+            ),
+            types.Part(function_call=types.FunctionCall(
+                name="check_connection_feasibility", args={},
+            )),
+            types.Part(function_call=types.FunctionCall(
+                name="compare_recovery_options",
+                args={"alternative_ids": ["SIM-001"]},
+            )),
+        ],
+    )
+    final_text = (
+        "The eligible simulated option was reviewed; any proposal requires "
+        "human approval."
+    )
+    models = Models([
+        types.GenerateContentResponse(
+            candidates=[types.Candidate(content=model_content)],
+        ),
+        types.GenerateContentResponse(candidates=[types.Candidate(
+            content=types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=final_text)],
+            ),
+        )]),
+    ])
+    sdk_client = type("Client", (), {"models": models})()
+    provider = GeminiCopilot("test-key", client_factory=lambda **_: sdk_client)
+    caplog.set_level("WARNING", logger="google.genai.types")
+
+    _, client, _, response = invoke_agent(tmp_path, provider)
+    try:
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["metadata"]["provider"] == "gemini"
+        assert body["metadata"]["fallback_used"] is False
+        assert body["summary"] == final_text
+        assert [item["name"] for item in body["tool_results"]] == [
+            "search_synthetic_alternatives",
+            "check_connection_feasibility",
+            "compare_recovery_options",
+        ]
+        assert len(models.requests) == 2
+        history = models.requests[1]["contents"]
+        assert history[1] is model_content
+        assert history[1].parts[0].thought_signature == b"opaque-thought-signature"
+        assert [
+            part.function_call.name for part in history[1].parts
+        ] == [
+            "search_synthetic_alternatives",
+            "check_connection_feasibility",
+            "compare_recovery_options",
+        ]
+        assert "non-text parts in the response" not in caplog.text
+        assert "opaque-thought-signature" not in caplog.text
+    finally:
+        close(client)
+
+
+def test_gemini_malformed_tool_call_is_logged_without_arguments(tmp_path, caplog):
+    caplog.set_level("INFO")
+    call = types.FunctionCall(
+        name="search_synthetic_alternatives",
+        args=None,
+    )
+    sdk_response = types.GenerateContentResponse(
+        candidates=[types.Candidate(content=types.Content(
+            role="model",
+            parts=[types.Part(function_call=call)],
+        ))],
+    )
+
+    class Models:
+        def generate_content(self, **kwargs):
+            return sdk_response
+
+    class Client:
+        models = Models()
+
+    provider = GeminiCopilot("test-key", client_factory=lambda **_: Client())
+
+    _, client, _, api_response = invoke_agent(
+        tmp_path, provider, trace_id="12345678-1234-5678-1234-567812345678",
+    )
+    try:
+        assert api_response.status_code == 200
+        assert api_response.json()["metadata"]["validation_status"] == "fallback_invalid_tool_call"
+        assert "stage=validate_tool_call" in caplog.text
+        assert "reason_code=malformed_tool_call" in caplog.text
+        assert "exception_class=InvalidAgentToolCall" in caplog.text
+        assert "trace_id=12345678-1234-5678-1234-567812345678" in caplog.text
+        assert "arguments=None" not in caplog.text
+        assert "test-key" not in caplog.text
+    finally:
+        close(client)
+
+
 def test_follow_up_timeout_preserves_tools_and_reports_deterministic_fallback(tmp_path):
     provider = FakeAgent([
         {"calls": [

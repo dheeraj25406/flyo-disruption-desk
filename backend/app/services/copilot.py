@@ -318,13 +318,26 @@ class GeminiCopilot(DeterministicCopilot):
                 temperature=0.2,
             ),
         )
-        calls = getattr(response, "function_calls", None) or []
         candidates = getattr(response, "candidates", None) or []
-        content = getattr(candidates[0], "content", None) if candidates else None
+        candidate = candidates[0] if candidates else None
+        content = getattr(candidate, "content", None)
+        parts = getattr(content, "parts", None) or []
+        calls = []
+        text_parts = []
+        for part in parts:
+            function_call = getattr(part, "function_call", None)
+            if function_call is not None:
+                calls.append({
+                    "name": getattr(function_call, "name", None),
+                    "arguments": getattr(function_call, "args", None),
+                })
+            text = getattr(part, "text", None)
+            if isinstance(text, str) and not getattr(part, "thought", False):
+                text_parts.append(text)
         return {
-            "calls": [{"name": call.name, "arguments": call.args} for call in calls],
+            "calls": calls,
             "content": content,
-            "text": getattr(response, "text", None),
+            "text": "".join(text_parts) if text_parts else None,
         }
 
     def _generate(
