@@ -10,7 +10,7 @@ All passenger records, flights, inventory options, availability, approvals, and 
 - Node.js 20.19 or newer (the current environment uses Node 25)
 - npm
 
-The backend works without an API key using its deterministic copilot fallback. A Gemini Developer API key is optional.
+The deterministic recovery engine works without an API key. A Gemini Developer API key is optional and enables Gemini-powered Copilot and Recovery Agent requests; without it, those workflows use clearly identified deterministic fallbacks.
 
 ## Start the backend
 
@@ -24,20 +24,20 @@ From the repository root:
 
 The backend creates its SQLite tables and synthetic seed data on startup. Its default database is backend/flyo.db. To use another SQLAlchemy URL, set DATABASE_URL in the environment before starting the server.
 
-### Configure Gemini
+On startup, the backend adds 25 namespaced synthetic Indian disruption cases, with fictional passenger/booking data and `DEMO-` flight identifiers. Seeding is repeatable and adds missing demo records without resetting existing database rows. The dashboard loads all cases from the backend API and searches passenger name, flight ID, PNR, case ID, and itinerary airport codes.
 
-1. Create a Gemini API key in [Google AI Studio](https://aistudio.google.com/app/apikey).
-2. Copy `.env.example` to `.env` only if you do not already have a `.env`; otherwise edit your existing file without replacing it.
-3. Set `GEMINI_API_KEY` in `.env`. Keep the model exactly `gemini-3.5-flash-lite`; the backend rejects a different configured model instead of switching silently.
-4. Export values in the terminal used to start the backend:
+### Configure Gemini (optional)
 
-       set -a
-       source ../.env
-       set +a
+The backend reads `GEMINI_API_KEY`, `GEMINI_MODEL`, `GEMINI_TIMEOUT_SECONDS`, and `GEMINI_MAX_OUTPUT_TOKENS` from the process environment. It does not load `.env` files. `.env.example` is a placeholder/reference only; supplying values to the shell that starts Uvicorn is required. For example, from the repository root in a POSIX shell:
 
-The API key stays in the backend environment and is never sent to the frontend. The Gemini client is created on the first copilot request, not at startup. If the key is missing, invalid, quota-limited, or the provider is unavailable, responses identify the deterministic fallback and never switch to another model.
+    export GEMINI_API_KEY='replace-with-your-gemini-api-key'
+    export GEMINI_MODEL='gemini-3.5-flash-lite'
+    export GEMINI_TIMEOUT_SECONDS='15'
+    export GEMINI_MAX_OUTPUT_TOKENS='1200'
+    cd backend
+    python -m uvicorn app.main:app --reload
 
-Defaults are a 15 second request timeout and 1200 output tokens. `GEMINI_TIMEOUT_SECONDS` accepts 1–120 and `GEMINI_MAX_OUTPUT_TOKENS` accepts 128–8192.
+The key is optional; omit it to use deterministic Copilot/Agent fallbacks. The Gemini client is created lazily on the first applicable request. The model defaults to and must equal `gemini-3.5-flash-lite`; the default timeout is 15 seconds (accepted range 1–120), and the default output-token limit is 1200 (accepted range 128–8192). Provider errors and invalid model output are reported as fallbacks; there is no alternate-model fallback. Live Gemini behavior has not been verified as part of this project audit.
 
 ## Start the frontend
 
@@ -51,24 +51,42 @@ Open the Vite URL shown in the terminal (normally http://localhost:5173). The de
 
 ## Try the workflow
 
-1. Use **Trigger demo event** to submit a synthetic cancellation for FL-1001. This invokes the existing cancellation webhook and creates cases for matching seeded bookings.
+1. Use **Trigger demo event** to submit a synthetic cancellation for DEMO-AI-2101 (or another seeded DEMO flight). This invokes the existing cancellation webhook and creates a new event-linked case.
 2. Open a case and select **Evaluate case** to persist a deterministic risk assessment and recovery recommendation.
 3. Inspect connection findings, policy version, reason codes, and simulated alternatives.
 4. Create an eligible action proposal. It remains pending until you select **Approve** and confirm, or reject it and confirm.
 5. Inspect the result and case activity timeline. The simulator reports its outcome as synthetic and never claims real-world completion.
-6. Use the case copilot for structured analysis, comparison of policy-eligible simulated options, and case-scoped questions. Each response shows whether Gemini or the deterministic fallback handled it and includes evidence references.
+6. Use the case copilot for structured analysis and case-scoped questions. Each response shows whether Gemini or the deterministic fallback handled it and includes evidence references.
 7. Generate a passenger-message draft, edit it locally if needed, and note the **Draft — not sent** label. Drafting alone does not create or execute an action.
 
 ### Copilot architecture and boundaries
 
-- Deterministic itinerary risk checks and the versioned recovery policy remain authoritative for eligibility and ranking. Gemini can explain stored evidence but cannot change a decision, add inventory, set prices or availability, or invoke actions.
+- Deterministic itinerary risk checks and the versioned recovery policy are the recovery engine: they determine eligibility, connection feasibility, and alternative ranking from persisted synthetic data. They work independently of Gemini.
+- Gemini-powered Copilot can explain verified case facts and recovery results, and answer case-scoped questions. The bounded Gemini Recovery Agent can request only allowlisted tools; the backend validates tool calls and remains authoritative for eligibility and actions. With no key, these workflows use deterministic fallbacks.
 - Gemini uses Google's official `google-genai` Python SDK (`google-genai==1.47.0`, compatible with Python 3.9) and the exact model ID `gemini-3.5-flash-lite`. No other model is used as a fallback.
 - Gemini receives a minimal case context through structured-output requests. Responses are validated with Pydantic and evidence references are checked against the exact context supplied. Invalid output, unsupported draft claims, missing keys, timeouts, quota errors, and provider errors use deterministic responses with explicit metadata.
 - Passenger names are sent only for message drafting; draft context excludes itinerary risk details, candidate scores, and internal policy reason codes. Copilot prompts and questions are not stored in audit records. Audit records store operation and provider metadata.
-- Analysis, comparison, Q&A, and draft endpoints have no action tools. The bounded agent can request only an eligible simulated rebooking proposal when the request explicitly sets `allow_proposal` to true. Proposals still use the existing separate human approval workflow; no copilot endpoint approves or executes. Message drafts are labeled unsent and are not delivered.
+- Analysis, Q&A, and draft endpoints have no action tools. The bounded agent can request only an eligible simulated rebooking proposal when the request explicitly sets `allow_proposal` to true. Proposals still use the existing separate human approval workflow; no Copilot endpoint approves or executes. Message drafts are labeled unsent and are not delivered.
 - Without `GEMINI_API_KEY`, fallback responses provide simpler case-grounded summaries and conservative answers. Fallback output is never labeled as a Gemini response.
 
-Copilot API routes are `POST /cases/{case_id}/copilot/analyze`, `POST /cases/{case_id}/copilot/compare` (JSON body `{ "alternative_ids": ["SIM-001"] }`), `POST /cases/{case_id}/copilot/ask` (JSON body `{ "question": "..." }`), and the existing `POST /cases/{case_id}/draft-message`. Each response includes provider, model when applicable, fallback status, and validation status. Compare requests accept only inventory IDs in the case's latest persisted eligible decision.
+### API endpoints
+
+The current backend routes are:
+
+- `GET /health`
+- `POST /webhooks/flight-alerts`
+- `GET /cases` and `GET /cases/{case_id}`
+- `POST /cases/{case_id}/evaluate`
+- `POST /cases/{case_id}/copilot/analyze`
+- `POST /cases/{case_id}/copilot/ask` (JSON body: `{"question":"..."}`)
+- `POST /cases/{case_id}/agent/run` (JSON body includes `objective` and optional `allow_proposal`)
+- `POST /cases/{case_id}/actions`
+- `GET /actions/{action_id}`
+- `POST /actions/{action_id}/approve`
+- `POST /actions/{action_id}/reject`
+- `POST /cases/{case_id}/draft-message`
+
+There is no dedicated Copilot comparison endpoint. The Recovery Agent's internal allowlisted tools may inspect and compare eligible alternatives from the persisted deterministic decision; the model cannot create candidate availability or change eligibility.
 
 ### Bounded recovery agent
 
@@ -76,19 +94,9 @@ Copilot API routes are `POST /cases/{case_id}/copilot/analyze`, `POST /cases/{ca
 
 The agent cannot approve, reject, or execute actions. A proposal remains `PENDING_APPROVAL` and requires the existing separate human approval endpoint. Tool results are generated from the stored policy decision and synthetic inventory, not model-supplied flight facts. With no Gemini key or on provider/validation failure, a deterministic summary and read-only tool results are returned; fallback mode never creates proposals.
 
-### Testing Gemini
+### Testing
 
-Normal unit tests use mocked Gemini clients and never call the external API:
-
-    cd backend
-    python3 -m pytest -v
-
-To make one optional live request using a temporary synthetic case, first export a valid `GEMINI_API_KEY`, then run:
-
-    cd backend
-    python3 evaluations/gemini_smoke.py
-
-The smoke test verifies response metadata reports the required Gemini model. It exits with a skip status when the key is absent and is not part of pytest.
+Unit tests use mocked Gemini clients and do not make live provider requests. Live Gemini behavior has not been verified. See the complete test commands under [Verification](#verification).
 
 The demo event control creates cases only when explicitly triggered. Refreshing the page only reads existing data; it does not seed or create more cases. Intentionally triggering another event with a new event ID creates another synthetic event and a new case set for matching bookings.
 
@@ -104,7 +112,22 @@ Backend tests (temporary SQLite databases):
     cd backend
     python3 -m pytest -v
 
-The suite currently has 64 passing unit tests and uses mocked Gemini clients; it does not make external API requests.
+Current local results for this worktree: **76 backend tests passed** and **10 frontend tests passed**. The test count may change as tests are added. Unit tests use isolated SQLite databases and mocked Gemini clients; they do not make external API requests.
+
+Frontend lint:
+
+    cd frontend
+    npm run lint
+
+Frontend tests:
+
+    cd frontend
+    npm test
+
+Frontend production build:
+
+    cd frontend
+    npm run build
 
 Deterministic reliability evaluation:
 

@@ -3,12 +3,14 @@ from sqlalchemy import func, select
 
 from app.main import create_app
 from app.models import AuditEvent, Booking, DisruptionCase, RecoveryAction, RecoveryDecision
+from conftest import seed_legacy_test_data
 
 
 def setup_recommended_case(tmp_path, booking_ref="BK-101"):
-    app = create_app("sqlite:///{}".format(tmp_path / "actions.db"))
+    app = create_app("sqlite:///{}".format(tmp_path / "actions.db"), seed_data=False)
     client = TestClient(app)
     client.__enter__()
+    seed_legacy_test_data(app.state.session_factory)
     event_response = client.post("/webhooks/flight-alerts", json={
         "event_id": "evt-actions", "fid": "FL-1001", "changes": {"status": "cancel"}
     })
@@ -51,9 +53,10 @@ def test_eligible_recommendation_creates_pending_action(tmp_path):
 
 
 def test_missing_or_ineligible_recommendation_cannot_create_rebook(tmp_path):
-    app = create_app("sqlite:///{}".format(tmp_path / "ineligible.db"))
+    app = create_app("sqlite:///{}".format(tmp_path / "ineligible.db"), seed_data=False)
     client = TestClient(app)
     client.__enter__()
+    seed_legacy_test_data(app.state.session_factory)
     try:
         client.post("/webhooks/flight-alerts", json={
             "event_id": "evt-ineligible", "fid": "FL-1001", "changes": {"status": "cancel"}

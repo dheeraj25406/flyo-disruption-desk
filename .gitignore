@@ -16,3 +16,6 @@ build/
 !.env.example
 frontend/node_modules/
 frontend/dist/
+
+# Local API secrets
+backend/.env

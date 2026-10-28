@@ -6,12 +6,14 @@ from app.models import AuditEvent, Booking, DisruptionCase, DisruptionEvent, Rec
 from app.schemas.itinerary import ItineraryLeg
 from app.services.policy import Alternative, DEFAULT_POLICY
 from app.services.risk import assess_connections
+from conftest import seed_legacy_test_data
 
 
 def setup_case(tmp_path, booking_ref="BK-100"):
-    app = create_app("sqlite:///{}".format(tmp_path / "recovery.db"))
+    app = create_app("sqlite:///{}".format(tmp_path / "recovery.db"), seed_data=False)
     client = TestClient(app)
     client.__enter__()
+    seed_legacy_test_data(app.state.session_factory)
     response = client.post("/webhooks/flight-alerts", json={
         "event_id": "evt-risk", "fid": "FL-1001", "changes": {"status": "cancel"}
     })

@@ -1,30 +1,33 @@
-# Flyo Disruption Desk — Milestones 1, 2A, and 2B
+# Flyo Disruption Desk — Backend
 
-A small FastAPI and SQLite portfolio demo for synthetic flight disruption events, case management, itinerary risk screening, deterministic recovery recommendations, human approval, simulated actions, and a deterministic AI copilot fallback. All passengers, bookings, flights, inventory, and availability are fictional. The service does not connect to airlines, payment providers, or messaging services and does not change real reservations.
+A FastAPI and SQLite backend for a synthetic flight-disruption demo. All passengers, bookings, flights, inventory, and availability are fictional. The service does not connect to airlines, payment providers, or messaging services and does not change real reservations.
 
 ## Setup
 
-Python 3.9 or newer is required. From this directory:
+Python 3.9 or newer is required. Runtime dependencies are declared in `pyproject.toml`; the development extra adds pytest and HTTPX. From this directory:
 
     python3 -m venv .venv
     source .venv/bin/activate
     python -m pip install -e '.[dev]'
 
-The app creates its SQLite tables and seeds the synthetic scenario on startup. By default the database is backend/flyo.db (ignored by Git). Set DATABASE_URL in the process environment to use another SQLAlchemy database URL.
+On application startup, the backend creates its SQLite tables and additively seeds 25 namespaced synthetic Indian disruption cases. Repeated startup does not reset existing rows or overwrite user-created records. The default database is `backend/flyo.db` when launched from this directory; it is ignored by Git. Set `DATABASE_URL` in the process environment to use another SQLAlchemy database URL.
 
-Milestone 2B adds only a new recovery_actions table. SQLAlchemy create_all() creates that table in an existing Milestone 1/2A database without deleting existing rows or requiring a database reset. It does not migrate arbitrary future column changes; this project has no migration framework yet.
+The project does not use a general migration framework. Startup creates missing tables and applies the specific SQLite compatibility additions in `app/db.py`; it does not migrate arbitrary future schema changes.
 
 ## Run and inspect
 
     python -m uvicorn app.main:app --reload
 
-Submit a cancellation and inspect the resulting cases:
+Inspect the 25 seeded synthetic Indian disruption cases:
+
+    curl http://127.0.0.1:8000/cases
+    curl http://127.0.0.1:8000/cases/1
+
+Submit an additional synthetic cancellation and inspect the new case:
 
     curl -X POST http://127.0.0.1:8000/webhooks/flight-alerts \
       -H 'Content-Type: application/json' \
-      -d '{"event_id":"evt-cancel-001","fid":"FL-1001","changes":{"status":"cancel"}}'
-    curl http://127.0.0.1:8000/cases
-    curl http://127.0.0.1:8000/cases/1
+      -d '{"event_id":"evt-cancel-001","fid":"DEMO-AI-2101","changes":{"status":"cancel"}}'
 
 Evaluate a case and inspect its recovery decision:
 
@@ -55,9 +58,25 @@ Run the bounded agent workflow (proposing is disabled unless explicitly enabled 
       -H 'Content-Type: application/json' \
       -d '{"objective":"Review simulated recovery options","allow_proposal":false}'
 
-The agent can search the persisted synthetic policy results, read the deterministic connection assessment, compare eligible alternatives in policy order, and request a rebooking proposal when `allow_proposal` is true. It cannot approve, reject, or execute actions. Proposals remain pending human approval. Tool arguments and names are allowlisted and validated; the backend executes tools, never SDK automatic execution. Gemini is limited to four tool calls and four turns. Missing keys or provider/tool failures use deterministic fallback behavior.
+The deterministic recovery engine applies itinerary risk checks, connection feasibility, and versioned policy rules to persisted synthetic alternatives. Its eligibility and ranking do not depend on Gemini. Copilot analysis and case questions, plus the bounded Recovery Agent, can use Gemini when configured; Gemini-generated outputs are validated and do not replace deterministic policy decisions.
 
-The provider-independent CopilotProvider supports the configured Gemini model when a backend API key is present and otherwise uses DeterministicCopilot. The draft endpoint records that it generated a draft; it never sends it. A SEND_MESSAGE action can only be proposed from a saved draft and requires its own explicit approval before the simulator records a delivery outcome.
+When `GEMINI_API_KEY` is absent, Copilot and Agent return explicitly identified deterministic fallback results. With a key, the backend lazily creates a client using the pinned `google-genai` SDK and configured model. The required model is `gemini-3.5-flash-lite`; the default request timeout is 15 seconds (range 1–120), and the default output limit is 1200 tokens (range 128–8192). Provider failures, invalid structured output, or invalid Agent tool calls are distinguished from validated Gemini results. No alternate model is selected automatically. Live Gemini behavior has not been verified in this audit.
+
+Configuration is read from the backend process environment; the application does not load `.env` files or `--env-file` settings. `.env.example` contains placeholders/reference defaults only and is not loaded automatically. To configure the running process, export variables in the same shell before starting Uvicorn (never put an actual key in source control):
+
+    export GEMINI_API_KEY='replace-with-your-gemini-api-key'
+    export GEMINI_MODEL='gemini-3.5-flash-lite'
+    export GEMINI_TIMEOUT_SECONDS='15'
+    export GEMINI_MAX_OUTPUT_TOKENS='1200'
+    python -m uvicorn app.main:app --reload
+
+`GEMINI_API_KEY` is optional. `DATABASE_URL` is also read from the process environment; by default the backend uses SQLite. Keep actual credentials out of logs, API responses, and Git.
+
+## API routes
+
+The current endpoints are `GET /health`, `POST /webhooks/flight-alerts`, `GET /cases`, `GET /cases/{case_id}`, `POST /cases/{case_id}/evaluate`, `POST /cases/{case_id}/copilot/analyze`, `POST /cases/{case_id}/copilot/ask`, `POST /cases/{case_id}/agent/run`, `POST /cases/{case_id}/actions`, `GET /actions/{action_id}`, `POST /actions/{action_id}/approve`, `POST /actions/{action_id}/reject`, and `POST /cases/{case_id}/draft-message`. There is no dedicated Copilot comparison endpoint.
+
+The Agent may internally inspect and compare alternatives using its fixed allowlist, but those alternatives and eligibility come from the persisted deterministic policy results.
 
 ## Action and decision behavior
 
@@ -81,15 +100,15 @@ SQLite serializes writers, and approval obtains an immediate write transaction b
 
 ## Tests
 
-    python -m pytest -v
+    python -m pytest -q
 
-The suite uses isolated temporary SQLite databases and deterministic synthetic data. It does not call external APIs.
+The current local suite has 76 passing backend tests. Tests use isolated temporary SQLite databases and mocked Gemini clients; they do not call external APIs. The count can change as the suite evolves.
 
 ## Limitations
 
 - Only cancellation webhooks are supported. The frontend, live airline/inventory integrations, real payments, and real message delivery are out of scope.
 - Itinerary timing is a screening heuristic, not official airline or airport connection validation.
 - Inventory, availability, recovery execution, refund review, and message delivery are simulated. A recommendation is not a confirmed or bookable ticket.
-- The fallback copilot is deterministic. No real LLM provider is configured; any future provider must keep policy decisions and human approvals separate.
+- Gemini is an optional language-model provider for Copilot explanations/questions and bounded Agent tool turns. It does not determine policy eligibility or authorize actions. Unit tests mock the provider; live Gemini behavior has not been verified.
 - API approval is not authenticated and uses a caller-supplied display name. It is not suitable for real passenger data or production operations.
 - SQLite is scoped to this single-process MVP; production concurrency, authentication, migrations, retention, and monitoring need further design.

@@ -8,6 +8,7 @@ class ItineraryLeg(BaseModel):
 
     sequence: int = Field(ge=1)
     flight_id: str = Field(min_length=1)
+    airline_name: Optional[str] = None
     origin: Optional[str] = None
     destination: Optional[str] = None
     # Kept as strings at the API boundary so malformed/missing schedules can be

@@ -38,31 +38,6 @@ class CopilotAnalysisResponse(AnalysisPayload):
     metadata: CopilotMetadata
 
 
-class AlternativeComparison(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    inventory_id: str
-    summary: str = Field(min_length=1, max_length=500)
-    pros: List[EvidenceStatement] = Field(default_factory=list, max_length=6)
-    cons: List[EvidenceStatement] = Field(default_factory=list, max_length=6)
-    connection_risks: List[EvidenceStatement] = Field(default_factory=list, max_length=6)
-    known_unknowns: List[str] = Field(default_factory=list, max_length=6)
-    evidence_refs: List[str] = Field(default_factory=list, max_length=12)
-
-
-class ComparisonPayload(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    options: List[AlternativeComparison] = Field(min_length=1, max_length=4)
-    policy_ranking_explanation: str = Field(min_length=1, max_length=700)
-    evidence_refs: List[str] = Field(default_factory=list, max_length=16)
-
-
-class CopilotComparisonResponse(ComparisonPayload):
-    case_id: int
-    metadata: CopilotMetadata
-
-
 class AskCopilotRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -80,12 +55,6 @@ class AskPayload(BaseModel):
 class CopilotAskResponse(AskPayload):
     case_id: int
     metadata: CopilotMetadata
-
-
-class CompareAlternativesRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    alternative_ids: List[str] = Field(min_length=1, max_length=4)
 
 
 class DraftPayload(BaseModel):

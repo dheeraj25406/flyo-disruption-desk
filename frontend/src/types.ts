@@ -14,6 +14,7 @@ export interface CaseListItem {
 export interface ItineraryLeg {
   sequence: number
   flight_id: string
+  airline_name?: string | null
   origin?: string | null
   destination?: string | null
   scheduled_departure?: string | null
@@ -67,6 +68,7 @@ export interface AuditTimelineItem {
 
 export interface CaseDetail extends CaseListItem {
   event_id: string
+  disruption_reason?: string | null
   itinerary: ItineraryLeg[]
   passenger_constraints: Record<string, unknown>
   audit_timeline: AuditTimelineItem[]
@@ -114,6 +116,28 @@ export interface CopilotMetadata {
   validation_status: string
 }
 
+export type AgentToolName =
+  | 'search_synthetic_alternatives'
+  | 'check_connection_feasibility'
+  | 'compare_recovery_options'
+  | 'propose_recovery_action'
+
+export interface AgentToolResult {
+  name: AgentToolName
+  status: 'completed' | 'blocked' | 'invalid'
+  result: Record<string, unknown>
+}
+
+export interface AgentRunResponse {
+  case_id: number
+  summary: string
+  tool_results: AgentToolResult[]
+  proposed_action_id: string | null
+  approval_required: boolean
+  simulated: true
+  metadata: CopilotMetadata
+}
+
 export interface EvidenceStatement {
   text: string
   evidence_refs: string[]
@@ -129,24 +153,6 @@ export interface CopilotAnalysisResponse {
   recommendation_explanation: string
   trade_offs: EvidenceStatement[]
   recommended_next_step: string
-  evidence_refs: string[]
-  metadata: CopilotMetadata
-}
-
-export interface AlternativeComparison {
-  inventory_id: string
-  summary: string
-  pros: EvidenceStatement[]
-  cons: EvidenceStatement[]
-  connection_risks: EvidenceStatement[]
-  known_unknowns: string[]
-  evidence_refs: string[]
-}
-
-export interface CopilotComparisonResponse {
-  case_id: number
-  options: AlternativeComparison[]
-  policy_ranking_explanation: string
   evidence_refs: string[]
   metadata: CopilotMetadata
 }

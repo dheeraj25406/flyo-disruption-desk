@@ -5,10 +5,12 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
 from app.main import create_app
-from app.models import AuditEvent, Booking, DisruptionCase, RecoveryAction
+from app.models import AuditEvent, Booking, DisruptionCase, RecoveryAction, RecoveryDecision
 from app.services.copilot import (
     DeterministicCopilot, GeminiCopilot, REQUIRED_MODEL, build_copilot_provider,
 )
+from app.services.request_diagnostics import log_request_diagnostic
+from conftest import seed_legacy_test_data
 
 
 class FakeResponse:
@@ -47,24 +49,6 @@ def analysis_json(ref="case.flight_id"):
     }
 
 
-def comparison_json(ids=("SIM-001", "SIM-002")):
-    options = []
-    refs = ["policy.decision_code"]
-    for inventory_id in ids:
-        base = "alternative.{}".format(inventory_id)
-        options.append({
-            "inventory_id": inventory_id,
-            "summary": "Eligible synthetic option {}.".format(inventory_id),
-            "pros": [{"text": "Passed persisted deterministic screening.", "evidence_refs": [base + ".eligible"]}],
-            "cons": [{"text": "Availability remains simulated.", "evidence_refs": [base + ".simulated"]}],
-            "connection_risks": [],
-            "known_unknowns": ["Real inventory is not connected."],
-            "evidence_refs": [base + ".route", base + ".flight_id", base + ".score", base + ".departure", base + ".arrival", base + ".eligible", base + ".simulated"],
-        })
-        refs.extend(options[-1]["evidence_refs"])
-    return {"options": options, "policy_ranking_explanation": "The stored policy score ranking is unchanged.", "evidence_refs": refs}
-
-
 def draft_json(message="Hello Jordan, we are sorry your flight FL-1001 was disrupted. Our team is reviewing your case and will share an update after the review."):
     return {"message": message, "evidence_refs": ["booking.passenger_name", "case.flight_id"], "warnings": []}
 
@@ -78,9 +62,10 @@ def new_provider(fake, **kwargs):
 
 
 def setup_case(tmp_path, provider=None, evaluate=True):
-    app = create_app("sqlite:///{}".format(tmp_path / "copilot.db"), copilot_provider=provider)
+    app = create_app("sqlite:///{}".format(tmp_path / "copilot.db"), seed_data=False, copilot_provider=provider)
     client = TestClient(app)
     client.__enter__()
+    seed_legacy_test_data(app.state.session_factory)
     event = client.post("/webhooks/flight-alerts", json={
         "event_id": "evt-copilot-test", "fid": "FL-1001", "changes": {"status": "cancel"}
     })
@@ -130,8 +115,46 @@ def test_gemini_analysis_accepts_valid_structured_output_and_exact_model(tmp_pat
         config = fake.models.calls[0]["config"]
         assert config.response_mime_type == "application/json"
         assert config.tools is None
+        assert isinstance(config.response_schema, dict)
+        assert '"additionalProperties"' not in json.dumps(config.response_schema)
+        assert "cite references that directly contain" in config.system_instruction
     finally:
         teardown(client)
+
+
+def test_analysis_prompt_sends_compact_evidence_without_duplicate_context(tmp_path):
+    fake = FakeClient([analysis_json()])
+    _, client, case_id, _ = setup_case(tmp_path, new_provider(fake))
+    try:
+        response = client.post("/cases/{}/copilot/analyze".format(case_id))
+        assert response.status_code == 200
+        request = json.loads(fake.models.calls[0]["contents"])
+        context = request["case_context"]
+        assert set(context) == {"evidence"}
+        assert "policy.decision_code" in context["evidence"]
+        assert "alternative.SIM-001.score" in context["evidence"]
+        assert "booking.booking_ref" not in context["evidence"]
+        assert not any(key.startswith("itinerary.") for key in context["evidence"])
+        assert "alternative.SIM-001.departure" not in context["evidence"]
+        assert len(fake.models.calls[0]["contents"]) < 4000
+    finally:
+        teardown(client)
+
+
+def test_sdk_retry_configuration_excludes_rate_limits(monkeypatch):
+    from google import genai
+
+    captured = {}
+    fake = FakeClient([])
+    monkeypatch.setattr(genai, "Client", lambda **kwargs: captured.update(kwargs) or fake)
+
+    provider = GeminiCopilot("unit-test-key")
+    assert provider._get_client() is fake
+    retries = captured["http_options"].retry_options
+    assert retries.attempts == 2
+    assert 429 not in retries.http_status_codes
+    assert 504 in retries.http_status_codes
+    assert captured["http_options"].timeout == 15000
 
 
 @pytest.mark.parametrize("invalid", ["not-json", {"disruption_summary": "missing required fields"}])
@@ -143,6 +166,41 @@ def test_invalid_structured_output_falls_back_safely(tmp_path, invalid):
         assert body["metadata"]["provider"] == "deterministic_fallback"
         assert body["metadata"]["fallback_used"] is True
         assert body["metadata"]["validation_status"] == "fallback_invalid_output"
+    finally:
+        teardown(client)
+
+
+def test_analysis_provider_failure_returns_grounded_deterministic_analysis(tmp_path):
+    provider = new_provider(FakeClient([RuntimeError("private provider failure")]))
+    _, client, case_id, _ = setup_case(tmp_path, provider)
+    try:
+        response = client.post("/cases/{}/copilot/analyze".format(case_id))
+        assert response.status_code == 200
+        body = response.json()
+        assert body["analysis_status"] == "complete"
+        assert body["metadata"]["provider"] == "deterministic_fallback"
+        assert body["metadata"]["fallback_used"] is True
+        assert body["metadata"]["validation_status"] == "fallback_provider_error"
+        assert "FL-1001" in body["disruption_summary"]
+        allowed_refs = {
+            "case.flight_id", "case.status", "booking.booking_ref", "flight.status",
+            "policy.decision_code", "policy.explanation", "policy.reason_codes",
+        }
+        assert set(body["evidence_refs"]).issubset(allowed_refs)
+        assert "private provider failure" not in response.text
+    finally:
+        teardown(client)
+
+
+def test_extra_model_fields_are_rejected_by_pydantic_after_schema_adaptation(tmp_path):
+    invalid = analysis_json()
+    invalid["model_added_field"] = "unsupported"
+    provider = new_provider(FakeClient([invalid]))
+    _, client, case_id, _ = setup_case(tmp_path, provider)
+    try:
+        body = client.post("/cases/{}/copilot/analyze".format(case_id)).json()
+        assert body["metadata"]["validation_status"] == "fallback_invalid_output"
+        assert "model_added_field" not in json.dumps(body)
     finally:
         teardown(client)
 
@@ -175,83 +233,111 @@ def test_fact_claim_that_conflicts_with_cited_evidence_causes_fallback(tmp_path)
 
 
 def test_analysis_without_persisted_decision_reports_incomplete_without_calling_model(tmp_path):
-    fake = FakeClient([])
-    app, client, case_id, _ = setup_case(tmp_path, new_provider(fake), evaluate=False)
-    try:
-        body = client.post("/cases/{}/copilot/analyze".format(case_id)).json()
-        assert body["analysis_status"] == "incomplete"
-        assert body["missing_information"]
-        assert body["metadata"]["validation_status"] == "incomplete_context"
-        assert fake.models.calls == []
-    finally:
-        teardown(client)
-
-
-def test_compare_accepts_only_persisted_eligible_alternatives(tmp_path):
-    provider = new_provider(FakeClient([comparison_json()]))
-    _, client, case_id, _ = setup_case(tmp_path, provider)
-    try:
-        result = client.post("/cases/{}/copilot/compare".format(case_id), json={
-            "alternative_ids": ["SIM-001", "SIM-002"]
-        })
-        assert result.status_code == 200, result.text
-        assert {item["inventory_id"] for item in result.json()["options"]} == {"SIM-001", "SIM-002"}
-        assert result.json()["metadata"]["provider"] == "gemini"
-    finally:
-        teardown(client)
-
-
-@pytest.mark.parametrize("alternative_id", ["NOT-AN-OPTION", "SIM-004"])
-def test_unknown_or_ineligible_alternative_comparison_is_rejected(tmp_path, alternative_id):
-    fake = FakeClient([])
+    fake = FakeClient([analysis_json()])
     provider = new_provider(fake)
-    _, client, case_id, _ = setup_case(tmp_path, provider)
+    app, client, case_id, _ = setup_case(tmp_path, provider, evaluate=False)
     try:
-        response = client.post("/cases/{}/copilot/compare".format(case_id), json={"alternative_ids": [alternative_id]})
-        assert response.status_code == 422
-        assert "ineligible" in response.json()["detail"]
+        from app.services.copilot import build_case_context
+
+        with app.state.session_factory() as session:
+            case = session.get(DisruptionCase, case_id)
+            booking = session.get(Booking, case.booking_id)
+            incomplete_context = build_case_context(session, case, booking)
+        direct_result = provider.analyze(incomplete_context)
+        assert direct_result.analysis_status == "incomplete"
+        assert direct_result.metadata.validation_status == "incomplete_context"
+        assert direct_result.missing_information
         assert fake.models.calls == []
-    finally:
-        teardown(client)
 
-
-def test_compare_rejects_model_output_that_invents_option_ids(tmp_path):
-    provider = new_provider(FakeClient([comparison_json(("SIM-001", "SIM-FABRICATED"))]))
-    _, client, case_id, _ = setup_case(tmp_path, provider)
-    try:
-        response = client.post("/cases/{}/copilot/compare".format(case_id), json={"alternative_ids": ["SIM-001", "SIM-002"]})
+        response = client.post("/cases/{}/copilot/analyze".format(case_id))
         assert response.status_code == 200
         body = response.json()
-        assert {item["inventory_id"] for item in body["options"]} == {"SIM-001", "SIM-002"}
-        assert body["metadata"]["validation_status"] == "fallback_invalid_output"
+        assert body["analysis_status"] == "complete"
+        assert body["metadata"]["provider"] == "gemini"
+        assert body["metadata"]["fallback_used"] is False
+        assert body["metadata"]["validation_status"] == "validated"
+        assert len(fake.models.calls) == 1
+        with app.state.session_factory() as session:
+            assert session.scalar(
+                select(RecoveryDecision.id).where(RecoveryDecision.case_id == case_id)
+            ) is not None
     finally:
         teardown(client)
 
 
-def test_compare_rejects_claim_that_persisted_eligible_option_is_ineligible(tmp_path):
-    payload = comparison_json()
-    payload["options"][0]["summary"] = "SIM-001 is ineligible."
-    provider = new_provider(FakeClient([payload]))
+def test_request_diagnostic_logging_failure_does_not_escape():
+    class BrokenLogger:
+        def info(self, *_args, **_kwargs):
+            raise RuntimeError("logger unavailable")
+
+    log_request_diagnostic(
+        BrokenLogger(), "analyze", "12345678-1234-5678-1234-567812345678",
+        "endpoint_entry",
+    )
+
+
+def test_analysis_trace_id_correlates_endpoint_and_provider_failure(
+    tmp_path, caplog,
+):
+    caplog.set_level("INFO")
+    trace_id = "12345678-1234-5678-1234-567812345678"
+    provider = new_provider(FakeClient([RuntimeError("private passenger and provider detail")]))
     _, client, case_id, _ = setup_case(tmp_path, provider)
     try:
-        response = client.post("/cases/{}/copilot/compare".format(case_id), json={"alternative_ids": ["SIM-001", "SIM-002"]})
+        response = client.post(
+            "/cases/{}/copilot/analyze".format(case_id),
+            headers={"X-Request-ID": trace_id},
+        )
         assert response.status_code == 200
-        assert response.json()["metadata"]["validation_status"] == "fallback_invalid_evidence"
-        assert "not an eligible" not in response.json()["options"][0]["summary"].lower()
+        assert response.json()["metadata"]["validation_status"] == "fallback_provider_error"
+        lines = [line for line in caplog.text.splitlines() if trace_id in line]
+        assert len(lines) == 5
+        assert all("operation=analyze" in line for line in lines)
+        assert any("Gemini copilot failed:" in line and "stage=provider_request" in line for line in lines)
+        assert any("stage=endpoint_entry" in line for line in lines)
+        assert any("stage=provider_call_start" in line for line in lines)
+        assert any("stage=provider_return" in line and "category=fallback_provider_error" in line for line in lines)
+        assert any("stage=endpoint_exit" in line for line in lines)
+        provider_line = next(line for line in lines if "Gemini copilot failed:" in line)
+        assert "exception_class=RuntimeError" in provider_line
+        assert "category=fallback_provider_error" in provider_line
+        assert "private passenger and provider detail" not in caplog.text
+        assert "private passenger and provider detail" not in response.text
     finally:
         teardown(client)
 
 
-def test_comparison_without_decision_returns_clear_conflict(tmp_path):
-    _, client, case_id, _ = setup_case(tmp_path, DeterministicCopilot(), evaluate=False)
+def test_ask_evaluates_missing_decision_and_correlates_trace_id(tmp_path, caplog):
+    caplog.set_level("INFO")
+    trace_id = "12345678-1234-5678-1234-567812345678"
+    fake = FakeClient([ask_json()])
+    provider = new_provider(fake)
+    app, client, case_id, _ = setup_case(tmp_path, provider, evaluate=False)
+    question = "What should happen with this synthetic booking?"
     try:
-        response = client.post("/cases/{}/copilot/compare".format(case_id), json={"alternative_ids": ["SIM-001"]})
-        assert response.status_code == 409
+        response = client.post(
+            "/cases/{}/copilot/ask".format(case_id),
+            headers={"X-Request-ID": trace_id},
+            json={"question": question},
+        )
+        assert response.status_code == 200
+        assert response.json()["metadata"]["validation_status"] == "validated"
+        assert len(fake.models.calls) == 1
+        with app.state.session_factory() as session:
+            assert session.scalar(
+                select(RecoveryDecision.id).where(RecoveryDecision.case_id == case_id)
+            ) is not None
+        lines = [line for line in caplog.text.splitlines() if trace_id in line]
+        assert any("operation=ask" in line and "stage=endpoint_entry" in line for line in lines)
+        assert any("operation=ask" in line and "stage=provider_call_start" in line for line in lines)
+        assert any("operation=ask" in line and "stage=provider_return" in line for line in lines)
+        assert any("operation=ask" in line and "stage=endpoint_exit" in line for line in lines)
+        assert question not in caplog.text
     finally:
         teardown(client)
 
 
-def test_rate_limit_falls_back_and_does_not_leak_provider_error(tmp_path):
+def test_rate_limit_falls_back_and_logs_safe_diagnostic(tmp_path, caplog):
     class QuotaError(Exception):
         status_code = 429
     secret = "do-not-echo-this-test-key"
@@ -263,6 +349,10 @@ def test_rate_limit_falls_back_and_does_not_leak_provider_error(tmp_path):
         body = response.json()
         assert body["metadata"]["validation_status"] == "fallback_rate_limited"
         assert secret not in response.text
+        assert "category=fallback_rate_limited" in caplog.text
+        assert "exception_class=QuotaError" in caplog.text
+        assert "http_status=429" in caplog.text
+        assert secret not in caplog.text
     finally:
         teardown(client)
 
@@ -289,6 +379,31 @@ def test_network_timeout_falls_back(tmp_path):
         assert response.status_code == 200
         assert response.json()["metadata"]["validation_status"] == "fallback_timeout"
         assert "private timeout detail" not in response.text
+    finally:
+        teardown(client)
+
+
+def test_http_504_uses_timeout_fallback_metadata_and_safe_logging(tmp_path, caplog):
+    class GatewayTimeout(Exception):
+        code = 504
+
+    secret = "do-not-log-provider-detail"
+    provider = new_provider(FakeClient([GatewayTimeout(secret)]))
+    _, client, case_id, _ = setup_case(tmp_path, provider)
+    try:
+        response = client.post("/cases/{}/copilot/analyze".format(case_id))
+        assert response.status_code == 200
+        assert response.json()["metadata"] == {
+            "provider": "deterministic_fallback",
+            "model": REQUIRED_MODEL,
+            "fallback_used": True,
+            "validation_status": "fallback_timeout",
+        }
+        assert "category=fallback_timeout" in caplog.text
+        assert "exception_class=GatewayTimeout" in caplog.text
+        assert "http_status=504" in caplog.text
+        assert secret not in caplog.text
+        assert secret not in response.text
     finally:
         teardown(client)
 
@@ -348,13 +463,18 @@ def test_question_answer_is_evidence_referenced_and_case_scoped(tmp_path):
         teardown(client)
 
 
-def test_question_answer_with_fabricated_reference_uses_fallback(tmp_path):
+def test_question_answer_with_fabricated_reference_uses_fallback(tmp_path, caplog):
     provider = new_provider(FakeClient([ask_json("case.future_status")]))
     _, client, case_id, _ = setup_case(tmp_path, provider)
     try:
         body = client.post("/cases/{}/copilot/ask".format(case_id), json={"question": "What happens next?"}).json()
         assert body["metadata"]["validation_status"] == "fallback_invalid_evidence"
         assert body["missing_information"]
+        assert "operation=ask" in caplog.text
+        assert "stage=output_validation" in caplog.text
+        assert "category=fallback_invalid_evidence" in caplog.text
+        assert "exception_class=ValidationError" in caplog.text
+        assert caplog.text.count("Gemini copilot failed:") == 1
     finally:
         teardown(client)
 
@@ -373,7 +493,7 @@ def test_prompt_injection_in_passenger_field_is_sanitized_before_model_call(tmp_
         call = fake.models.calls[0]
         assert "untrusted case data" in call["config"].system_instruction
         assert injection not in call["contents"]
-        assert '"passenger_name": "there"' in call["contents"]
+        assert '"booking.passenger_name": "there"' in call["contents"]
         assert call["config"].tools is None
         assert injection not in response.json()["draft_message"]
         assert action_count(app) == 0
@@ -381,18 +501,16 @@ def test_prompt_injection_in_passenger_field_is_sanitized_before_model_call(tmp_
         teardown(client)
 
 
-def test_analysis_comparison_and_qa_do_not_execute_actions(tmp_path):
-    fake = FakeClient([analysis_json(), comparison_json(), ask_json()])
+def test_analysis_and_qa_do_not_execute_actions(tmp_path):
+    fake = FakeClient([analysis_json(), ask_json()])
     provider = new_provider(fake)
-    app, client, case_id, decision = setup_case(tmp_path, provider)
+    app, client, case_id, _ = setup_case(tmp_path, provider)
     try:
         assert client.post("/cases/{}/copilot/analyze".format(case_id)).status_code == 200
-        ids = [item["inventory_id"] for item in decision["candidates"][:2]]
-        assert client.post("/cases/{}/copilot/compare".format(case_id), json={"alternative_ids": ids}).status_code == 200
         assert client.post("/cases/{}/copilot/ask".format(case_id), json={"question": "Explain this case."}).status_code == 200
         assert action_count(app) == 0
         with app.state.session_factory() as session:
-            assert session.scalar(select(func.count()).select_from(AuditEvent).where(AuditEvent.action.like("copilot_%"))) == 3
+            assert session.scalar(select(func.count()).select_from(AuditEvent).where(AuditEvent.action.like("copilot_%"))) == 2
     finally:
         teardown(client)
 
@@ -402,6 +520,18 @@ def test_missing_case_returns_404_for_copilot_endpoints(tmp_path):
     try:
         assert client.post("/cases/99999/copilot/analyze").status_code == 404
         assert client.post("/cases/99999/copilot/ask", json={"question": "Where is the flight?"}).status_code == 404
+    finally:
+        teardown(client)
+
+
+def test_compare_endpoint_is_removed(tmp_path):
+    _, client, case_id, _ = setup_case(tmp_path, DeterministicCopilot())
+    try:
+        response = client.post(
+            "/cases/{}/copilot/compare".format(case_id),
+            json={"alternative_ids": ["SIM-001"]},
+        )
+        assert response.status_code == 404
     finally:
         teardown(client)
 

@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -10,8 +12,8 @@ from app.schemas.cases import (
 )
 from app.schemas.flight_alert import FlightAlert
 from app.schemas.copilot import (
-    AgentRunRequest, AgentRunResponse, AskCopilotRequest, CompareAlternativesRequest,
-    CopilotAnalysisResponse, CopilotAskResponse, CopilotComparisonResponse,
+    AgentRunRequest, AgentRunResponse, AskCopilotRequest,
+    CopilotAnalysisResponse, CopilotAskResponse,
 )
 from app.services.actions import (
     ActionEligibilityError, ActionIdempotencyConflict, InvalidActionTransition,
@@ -20,9 +22,51 @@ from app.services.actions import (
 from app.services.copilot import build_case_context, draft_case_message
 from app.services.disruptions import UnknownFlightError, process_cancellation
 from app.services.agent import run_case_agent
+from app.services.request_diagnostics import (
+    log_request_diagnostic,
+    reset_request_trace_id,
+    request_trace_id,
+    set_request_trace_id,
+)
 from app.services.recovery import evaluate_case
 
 router = APIRouter()
+LOGGER = logging.getLogger(__name__)
+
+def _trace_endpoint(
+    operation: str,
+    trace_id: str,
+    stage: str,
+    *,
+    category="none",
+    http_status=None,
+    exception_class=None,
+    provider_code=None,
+    provider_status=None,
+) -> None:
+    log_request_diagnostic(
+        LOGGER, operation, trace_id, stage,
+        category=category, http_status=http_status,
+        exception_class=exception_class,
+        provider_code=provider_code, provider_status=provider_status,
+    )
+
+
+def _fallback_category(result) -> str:
+    metadata = getattr(result, "metadata", None)
+    if metadata is None:
+        return "validated"
+    return metadata.validation_status if metadata.fallback_used else "validated"
+
+
+def _endpoint_error_fields(error: Exception):
+    status = error.status_code if isinstance(error, HTTPException) else (
+        getattr(error, "status_code", None) or getattr(error, "code", None) or 500
+    )
+    if not isinstance(status, int):
+        status = 500
+    category = "http_error" if isinstance(error, HTTPException) else "endpoint_error"
+    return status, category
 
 
 def get_session(request: Request):
@@ -116,6 +160,7 @@ def get_case(case_id: int, session: Session = Depends(get_session)):
         status=case.status,
         created_at=case.created_at,
         event_id=case.event_id,
+        disruption_reason=(event.payload or {}).get("reason") if event is not None else None,
         itinerary=sorted(booking.itinerary or [], key=lambda leg: leg.get("sequence", 0)),
         passenger_constraints=booking.passenger_constraints or {},
         audit_timeline=timeline,
@@ -165,13 +210,19 @@ def evaluate_recovery(case_id: int, session: Session = Depends(get_session)):
     )
 
 
-def _copilot_case_context(session: Session, case_id: int):
+def _copilot_case_context(session: Session, case_id: int, ensure_evaluation: bool = False):
     case = session.get(DisruptionCase, case_id)
     if case is None:
         raise HTTPException(status_code=404, detail=f"Case not found: {case_id}")
     booking = session.get(Booking, case.booking_id)
     if booking is None:
         raise HTTPException(status_code=404, detail="Booking associated with case was not found")
+    if ensure_evaluation and session.scalar(
+        select(RecoveryDecision.id)
+        .where(RecoveryDecision.case_id == case.id)
+        .limit(1)
+    ) is None:
+        evaluate_case(session, case, booking)
     return case, build_case_context(session, case, booking)
 
 
@@ -192,42 +243,58 @@ def _audit_copilot(session: Session, case: DisruptionCase, action: str, result):
 
 @router.post("/cases/{case_id}/copilot/analyze", response_model=CopilotAnalysisResponse)
 def analyze_case(case_id: int, request: Request, session: Session = Depends(get_session)):
-    case, context = _copilot_case_context(session, case_id)
-    result = request.app.state.copilot_provider.analyze(context)
-    _audit_copilot(session, case, "copilot_analysis_generated", result)
-    session.commit()
-    return result
-
-
-@router.post("/cases/{case_id}/copilot/compare", response_model=CopilotComparisonResponse)
-def compare_case_alternatives(
-    case_id: int,
-    body: CompareAlternativesRequest,
-    request: Request,
-    session: Session = Depends(get_session),
-):
-    case, context = _copilot_case_context(session, case_id)
-    if context.decision is None:
-        raise HTTPException(status_code=409, detail="Evaluate this case before comparing alternatives")
-    if len(set(body.alternative_ids)) != len(body.alternative_ids):
-        raise HTTPException(status_code=422, detail="Alternative identifiers must be unique")
-    eligible_ids = {item["inventory_id"] for item in context.alternatives}
-    invalid_ids = [item for item in body.alternative_ids if item not in eligible_ids]
-    if invalid_ids:
-        raise HTTPException(status_code=422, detail="Unknown or ineligible alternatives: {}".format(", ".join(invalid_ids)))
-    result = request.app.state.copilot_provider.compare(context, body.alternative_ids)
-    _audit_copilot(session, case, "copilot_comparison_generated", result)
-    session.commit()
-    return result
+    trace_id = request_trace_id(request)
+    token = set_request_trace_id(trace_id)
+    _trace_endpoint("analyze", trace_id, "endpoint_entry")
+    try:
+        case, context = _copilot_case_context(session, case_id, ensure_evaluation=True)
+        _trace_endpoint("analyze", trace_id, "provider_call_start")
+        result = request.app.state.copilot_provider.analyze(context)
+        category = _fallback_category(result)
+        _trace_endpoint("analyze", trace_id, "provider_return", http_status=200, category=category)
+        _audit_copilot(session, case, "copilot_analysis_generated", result)
+        session.commit()
+        _trace_endpoint("analyze", trace_id, "endpoint_exit", http_status=200, category=category)
+        return result
+    except Exception as error:
+        status, category = _endpoint_error_fields(error)
+        _trace_endpoint(
+            "analyze", trace_id, "endpoint_exception", http_status=status,
+            category=category, exception_class=type(error).__name__,
+            provider_code=getattr(error, "code", None),
+            provider_status=getattr(error, "status", None),
+        )
+        raise
+    finally:
+        reset_request_trace_id(token)
 
 
 @router.post("/cases/{case_id}/copilot/ask", response_model=CopilotAskResponse)
 def ask_case(case_id: int, body: AskCopilotRequest, request: Request, session: Session = Depends(get_session)):
-    case, context = _copilot_case_context(session, case_id)
-    result = request.app.state.copilot_provider.answer(context, body.question)
-    _audit_copilot(session, case, "copilot_question_answered", result)
-    session.commit()
-    return result
+    trace_id = request_trace_id(request)
+    token = set_request_trace_id(trace_id)
+    _trace_endpoint("ask", trace_id, "endpoint_entry")
+    try:
+        case, context = _copilot_case_context(session, case_id, ensure_evaluation=True)
+        _trace_endpoint("ask", trace_id, "provider_call_start")
+        result = request.app.state.copilot_provider.answer(context, body.question)
+        category = _fallback_category(result)
+        _trace_endpoint("ask", trace_id, "provider_return", http_status=200, category=category)
+        _audit_copilot(session, case, "copilot_question_answered", result)
+        session.commit()
+        _trace_endpoint("ask", trace_id, "endpoint_exit", http_status=200, category=category)
+        return result
+    except Exception as error:
+        status, category = _endpoint_error_fields(error)
+        _trace_endpoint(
+            "ask", trace_id, "endpoint_exception", http_status=status,
+            category=category, exception_class=type(error).__name__,
+            provider_code=getattr(error, "code", None),
+            provider_status=getattr(error, "status", None),
+        )
+        raise
+    finally:
+        reset_request_trace_id(token)
 
 
 @router.post("/cases/{case_id}/agent/run", response_model=AgentRunResponse)
@@ -237,18 +304,37 @@ def run_recovery_agent(
     request: Request,
     session: Session = Depends(get_session),
 ):
-    case = session.get(DisruptionCase, case_id)
-    if case is None:
-        raise HTTPException(status_code=404, detail=f"Case not found: {case_id}")
-    booking = session.get(Booking, case.booking_id)
-    if booking is None:
-        raise HTTPException(status_code=404, detail="Booking associated with case was not found")
-    result = run_case_agent(
-        session, case, booking, request.app.state.copilot_provider,
-        body.objective, body.allow_proposal,
-    )
-    session.commit()
-    return result
+    trace_id = request_trace_id(request)
+    token = set_request_trace_id(trace_id)
+    _trace_endpoint("agent", trace_id, "endpoint_entry")
+    try:
+        case = session.get(DisruptionCase, case_id)
+        if case is None:
+            raise HTTPException(status_code=404, detail=f"Case not found: {case_id}")
+        booking = session.get(Booking, case.booking_id)
+        if booking is None:
+            raise HTTPException(status_code=404, detail="Booking associated with case was not found")
+        _trace_endpoint("agent", trace_id, "provider_call_start")
+        result = run_case_agent(
+            session, case, booking, request.app.state.copilot_provider,
+            body.objective, body.allow_proposal,
+        )
+        category = _fallback_category(result)
+        _trace_endpoint("agent", trace_id, "provider_return", http_status=200, category=category)
+        session.commit()
+        _trace_endpoint("agent", trace_id, "endpoint_exit", http_status=200, category=category)
+        return result
+    except Exception as error:
+        status, category = _endpoint_error_fields(error)
+        _trace_endpoint(
+            "agent", trace_id, "endpoint_exception", http_status=status,
+            category=category, exception_class=type(error).__name__,
+            provider_code=getattr(error, "code", None),
+            provider_status=getattr(error, "status", None),
+        )
+        raise
+    finally:
+        reset_request_trace_id(token)
 
 
 @router.post("/cases/{case_id}/actions", response_model=RecoveryActionResponse, status_code=201)

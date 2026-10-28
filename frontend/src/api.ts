@@ -1,10 +1,11 @@
 import type {
+  AgentRunResponse,
   CaseCopilotResponse,
   CaseDetail,
   CaseListItem,
   CopilotAnalysisResponse,
+  CopilotMetadata,
   CopilotAskResponse,
-  CopilotComparisonResponse,
   FlightAlertRequest,
   FlightAlertResponse,
   HealthResponse,
@@ -28,7 +29,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-function isMetadata(value: unknown): boolean {
+function isMetadata(value: unknown): value is CopilotMetadata {
   return isRecord(value) && typeof value.provider === 'string' &&
     typeof value.fallback_used === 'boolean' && typeof value.validation_status === 'string'
 }
@@ -38,7 +39,11 @@ function checked<T>(value: unknown, valid: boolean, label: string): T {
   return value as T
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+async function request<T>(
+  path: string,
+  init?: RequestInit,
+  onResponse?: (response: Response) => void,
+): Promise<T> {
   let response: Response
   try {
     response = await fetch(apiBase + path, {
@@ -51,6 +56,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   } catch {
     throw new ApiError('Could not reach the Flyo API. Check that the backend is running.', 0)
   }
+  onResponse?.(response)
 
   const text = await response.text()
   let data: unknown = null
@@ -69,6 +75,87 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new ApiError(detail, response.status)
   }
   return data as T
+}
+
+function newTraceId(): string {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID()
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (character) => {
+    const random = Math.random() * 16 | 0
+    return (character === 'x' ? random : (random & 0x3 | 0x8)).toString(16)
+  })
+}
+
+function logTrace(fields: {
+  operation: string
+  trace_id: string
+  stage: string
+  http_status: number | null
+  exception_class: string | null
+  category: string
+}): void {
+  try {
+    console.info('[flyo-trace]', fields)
+  } catch {
+    // Diagnostics must not interrupt an API request.
+  }
+}
+
+function responseCategory(value: unknown): string {
+  if (isRecord(value)) {
+    const metadata = value.metadata
+    if (isMetadata(metadata)) {
+      return metadata.fallback_used ? metadata.validation_status : 'validated'
+    }
+  }
+  return 'response_received'
+}
+
+async function tracedRequest<T>(
+  operation: 'analyze' | 'agent',
+  path: string,
+  init: RequestInit,
+  validate: (value: unknown) => T,
+): Promise<T> {
+  const traceId = newTraceId()
+  let httpStatus: number | null = null
+  logTrace({
+    operation,
+    trace_id: traceId,
+    stage: 'request_start',
+    http_status: null,
+    exception_class: null,
+    category: 'none',
+  })
+  try {
+    const result: unknown = await request(path, {
+      ...init,
+      headers: { 'X-Request-ID': traceId },
+    }, (response) => { httpStatus = response.status })
+    const parsed = validate(result)
+    logTrace({
+      operation,
+      trace_id: traceId,
+      stage: 'request_end',
+      http_status: httpStatus,
+      exception_class: null,
+      category: responseCategory(parsed),
+    })
+    return parsed
+  } catch (error) {
+    const status = httpStatus ?? (error instanceof ApiError ? error.status : null)
+    const errorName = error instanceof Error ? error.name : 'UnknownError'
+    logTrace({
+      operation,
+      trace_id: traceId,
+      stage: 'request_end',
+      http_status: status,
+      exception_class: /^[A-Za-z0-9_-]{1,64}$/.test(errorName) ? errorName : 'Error',
+      category: status === 0 ? 'network_error' : status !== null && status >= 400
+        ? 'http_or_response_error'
+        : 'request_error',
+    })
+    throw error
+  }
 }
 
 async function actionResponse(path: string, init?: RequestInit): Promise<RecoveryAction> {
@@ -167,21 +254,40 @@ export const api = {
     return checked<CaseCopilotResponse>(result, valid, 'copilot response')
   },
   async analyzeCopilot(caseId: number): Promise<CopilotAnalysisResponse> {
-    const result: unknown = await request('/cases/' + caseId + '/copilot/analyze', { method: 'POST' })
-    const valid = isRecord(result) && typeof result.case_id === 'number' &&
-      typeof result.disruption_summary === 'string' && Array.isArray(result.confirmed_facts) &&
-      Array.isArray(result.risk_findings) && Array.isArray(result.trade_offs) &&
-      Array.isArray(result.evidence_refs) && isMetadata(result.metadata)
-    return checked<CopilotAnalysisResponse>(result, valid, 'copilot analysis')
-  },
-  async compareCopilot(caseId: number, alternativeIds: string[]): Promise<CopilotComparisonResponse> {
-    const result: unknown = await request('/cases/' + caseId + '/copilot/compare', {
-      method: 'POST', body: JSON.stringify({ alternative_ids: alternativeIds }),
+    return tracedRequest('analyze', '/cases/' + caseId + '/copilot/analyze', { method: 'POST' }, (result) => {
+      const valid = isRecord(result) && typeof result.case_id === 'number' &&
+        typeof result.disruption_summary === 'string' && Array.isArray(result.confirmed_facts) &&
+        Array.isArray(result.risk_findings) && Array.isArray(result.trade_offs) &&
+        Array.isArray(result.evidence_refs) && isMetadata(result.metadata)
+      return checked<CopilotAnalysisResponse>(result, valid, 'copilot analysis')
     })
-    const valid = isRecord(result) && typeof result.case_id === 'number' &&
-      Array.isArray(result.options) && typeof result.policy_ranking_explanation === 'string' &&
-      Array.isArray(result.evidence_refs) && isMetadata(result.metadata)
-    return checked<CopilotComparisonResponse>(result, valid, 'copilot comparison')
+  },
+  async runAgent(caseId: number, objective: string): Promise<AgentRunResponse> {
+    return tracedRequest('agent', '/cases/' + caseId + '/agent/run', {
+      method: 'POST',
+      body: JSON.stringify({ objective, allow_proposal: false }),
+    }, (result) => {
+      const toolNames = [
+        'search_synthetic_alternatives',
+        'check_connection_feasibility',
+        'compare_recovery_options',
+        'propose_recovery_action',
+      ]
+      const validToolResults = (value: unknown): boolean =>
+        Array.isArray(value) && value.length <= 4 && value.every((item) =>
+          isRecord(item) && typeof item.name === 'string' && toolNames.includes(item.name) &&
+          ['completed', 'blocked', 'invalid'].includes(String(item.status)) && isRecord(item.result),
+        )
+      const valid = isRecord(result) &&
+        typeof result.case_id === 'number' &&
+        typeof result.summary === 'string' &&
+        validToolResults(result.tool_results) &&
+        (typeof result.proposed_action_id === 'string' || result.proposed_action_id === null) &&
+        typeof result.approval_required === 'boolean' &&
+        result.simulated === true &&
+        isMetadata(result.metadata)
+      return checked<AgentRunResponse>(result, valid, 'agent response')
+    })
   },
   async askCopilot(caseId: number, question: string): Promise<CopilotAskResponse> {
     const result: unknown = await request('/cases/' + caseId + '/copilot/ask', {

@@ -18,6 +18,7 @@ class CaseListItem(BaseModel):
 
 class CaseDetail(CaseListItem):
     event_id: str
+    disruption_reason: Optional[str] = None
     itinerary: list[ItineraryLeg]
     passenger_constraints: dict
     audit_timeline: list["AuditTimelineItem"] = Field(default_factory=list)

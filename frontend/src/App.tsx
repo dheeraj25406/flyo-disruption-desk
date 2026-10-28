@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
 import { api } from './api'
+import { matchesCaseSearch } from './caseSearch.js'
 import type {
-  ActionType, AuditTimelineItem, CandidateAlternative, CaseCopilotResponse,
+  ActionType, AgentRunResponse, AuditTimelineItem, CandidateAlternative, CaseCopilotResponse,
   CaseDetail, CaseListItem, CopilotAnalysisResponse, CopilotAskResponse,
-  CopilotComparisonResponse, CopilotMetadata, RecoveryAction,
+  CopilotMetadata, RecoveryAction,
 } from './types'
 import './App.css'
 
@@ -97,7 +98,7 @@ function App() {
   const [savedDraft, setSavedDraft] = useState('')
   const [copilot, setCopilot] = useState<CaseCopilotResponse | null>(null)
   const [analysis, setAnalysis] = useState<CopilotAnalysisResponse | null>(null)
-  const [comparison, setComparison] = useState<CopilotComparisonResponse | null>(null)
+  const [agentRun, setAgentRun] = useState<AgentRunResponse | null>(null)
   const [copilotAnswer, setCopilotAnswer] = useState<CopilotAskResponse | null>(null)
   const [copilotQuestion, setCopilotQuestion] = useState('')
   const [actionType, setActionType] = useState<ActionType>('REBOOK')
@@ -167,7 +168,7 @@ function App() {
     setSavedDraft(typeof persistedDraft === 'string' ? persistedDraft : '')
     setCopilot(null)
     setAnalysis(null)
-    setComparison(null)
+    setAgentRun(null)
     setCopilotAnswer(null)
     setCopilotQuestion('')
   }
@@ -188,7 +189,6 @@ function App() {
     void mutate('evaluate', async () => {
       await api.evaluate(selectedCase.id)
       setAnalysis(null)
-      setComparison(null)
       setCopilotAnswer(null)
       await refreshSelected()
       setNotice('Evaluation saved. Review the persisted decision and evidence below.')
@@ -200,7 +200,6 @@ function App() {
     void mutate('draft', async () => {
       const result = await api.draftMessage(selectedCase.id)
       setAnalysis(null)
-      setComparison(null)
       setCopilotAnswer(null)
       setDraft(result.draft_message || '')
       setSavedDraft(result.draft_message || '')
@@ -215,25 +214,28 @@ function App() {
     void mutate('copilot-analysis', async () => {
       const result = await api.analyzeCopilot(selectedCase.id)
       await refreshSelected()
-      setComparison(null)
       setCopilotAnswer(null)
       setCopilot(null)
       setAnalysis(result)
-      setNotice('Case analysis generated. The deterministic policy remains authoritative.')
+      setNotice(result.metadata.fallback_used
+        ? 'Deterministic case analysis is shown; the AI explanation was unavailable. The persisted policy remains authoritative.'
+        : 'AI case analysis generated. The deterministic policy remains authoritative.')
     })
   }
 
-  const compareAlternatives = () => {
-    if (!selectedCase?.latest_decision?.candidates.length) return
-    void mutate('copilot-compare', async () => {
-      const ids = selectedCase.latest_decision!.candidates.map((candidate) => candidate.inventory_id)
-      const result = await api.compareCopilot(selectedCase.id, ids)
+  const runRecoveryAgent = () => {
+    if (!selectedCase) return
+    void mutate('agent-run', async () => {
+      setAgentRun(null)
+      const result = await api.runAgent(
+        selectedCase.id,
+        'Review persisted synthetic recovery options and connection risks. Explain the policy decision using only returned tool evidence.',
+      )
       await refreshSelected()
-      setAnalysis(null)
-      setCopilotAnswer(null)
-      setCopilot(null)
-      setComparison(result)
-      setNotice('Comparison generated for eligible simulated options only.')
+      setAgentRun(result)
+      setNotice(result.metadata.fallback_used
+        ? 'Deterministic recovery workflow completed; the AI agent was unavailable. No proposal or action was created.'
+        : 'AI recovery agent completed in read-only mode. No proposal or action was created.')
     })
   }
 
@@ -243,7 +245,6 @@ function App() {
       const result = await api.askCopilot(selectedCase.id, copilotQuestion.trim())
       await refreshSelected()
       setAnalysis(null)
-      setComparison(null)
       setCopilot(null)
       setCopilotAnswer(result)
     })
@@ -302,8 +303,7 @@ function App() {
     const needle = query.trim().toLowerCase()
     return cases.filter((item) => {
       const code = details[item.id]?.latest_decision?.decision_code
-      const matchesText = !needle || [String(item.id), item.booking_ref, item.passenger_name, item.flight_id]
-        .some((field) => field.toLowerCase().includes(needle))
+      const matchesText = matchesCaseSearch(item, details[item.id], needle)
       const matchesFilter = filter === 'all' ||
         (filter === 'open' && item.status === 'open') ||
         (filter === 'evaluated' && Boolean(code)) ||
@@ -353,15 +353,15 @@ function App() {
           {error && <div className="alert-banner error-banner" role="alert"><Icon name="alert" /><span>{error}</span><button className="icon-button" aria-label="Dismiss error" onClick={() => setError('')}><Icon name="close" size={16} /></button></div>}
           {notice && <div className="alert-banner notice-banner" role="status"><Icon name="check" /><span>{notice}</span><button className="icon-button" aria-label="Dismiss notice" onClick={() => setNotice('')}><Icon name="close" size={16} /></button></div>}
           {selectedCase ? (
-            <CaseWorkspace detail={selectedCase} actions={selectedActions} draft={draft} savedDraft={savedDraft} copilot={copilot} analysis={analysis} comparison={comparison} copilotAnswer={copilotAnswer} copilotQuestion={copilotQuestion} actionType={actionType} candidateId={candidateId} busy={busy}
+            <CaseWorkspace detail={selectedCase} actions={selectedActions} draft={draft} savedDraft={savedDraft} copilot={copilot} analysis={analysis} agentRun={agentRun} copilotAnswer={copilotAnswer} copilotQuestion={copilotQuestion} actionType={actionType} candidateId={candidateId} busy={busy}
               onBack={() => setSelectedId(null)} onRefresh={() => void refreshSelected()} onEvaluate={() => runEvaluation()} onDraft={() => generateDraft()} onDraftChange={setDraft} onActionType={setActionType} onCandidate={setCandidateId} onPropose={() => createAction()}
-              onAnalyze={runCopilotAnalysis} onCompare={compareAlternatives} onAsk={askCopilot} onQuestionChange={setCopilotQuestion}
+              onAnalyze={runCopilotAnalysis} onRunAgent={runRecoveryAgent} onAsk={askCopilot} onQuestionChange={setCopilotQuestion}
               onApprove={(action) => setConfirm({ kind: 'approve', action })} onReject={(action) => setConfirm({ kind: 'reject', action })} />
           ) : view === 'activity' ? <ActivityPage items={timeline} onOpenCase={openCase} loading={loading} /> : (
             <section>
               <div className="page-heading"><div><div className="eyebrow">{view === 'operations' ? 'CONTROL ROOM' : 'WORKSPACE'} <span className="eyebrow-line" /></div><h1>{view === 'operations' ? 'Operations overview' : 'Case queue'}</h1><p>{view === 'operations' ? 'Monitor disruption cases and coordinate recovery review.' : 'Search and review synthetic passenger disruption cases.'}</p></div><button className="button button-secondary" onClick={() => void refreshQuietly()} type="button" disabled={refreshing}><Icon name="refresh" size={16} />{refreshing ? 'Refreshing…' : 'Refresh data'}</button></div>
               {view === 'operations' && <div className="metric-grid"><Metric label="Total cases" value={cases.length} icon="cases" detail="Local demo dataset" tone="navy" /><Metric label="Open cases" value={openCount} icon="clock" detail="Awaiting review or resolution" tone="amber" /><Metric label="Recommendations ready" value={recommendationCount} icon="route" detail="Require human approval" tone="teal" /><Metric label="Needs attention" value={attentionCount} icon="alert" detail="Escalated or manual review" tone="rose" /></div>}
-              <Queue cases={filteredCases} details={details} query={query} filter={filter} loading={loading} view={view} onQuery={setQuery} onFilter={setFilter} onOpen={openCase} onDemo={() => setDemoOpen(true)} />
+              <Queue cases={filteredCases} totalCases={cases.length} details={details} query={query} filter={filter} loading={loading} view={view} onQuery={setQuery} onFilter={setFilter} onOpen={openCase} onDemo={() => setDemoOpen(true)} />
               <div className="dashboard-foot"><span><Icon name="shield" size={14} />All records and outcomes are simulated.</span><span>{pendingCount} action{pendingCount === 1 ? '' : 's'} awaiting approval</span></div>
             </section>
           )}
@@ -381,28 +381,30 @@ function Metric({ label, value, icon, detail, tone }: { label: string; value: nu
   return <article className="metric-card"><div className={'metric-icon metric-' + tone}><Icon name={icon} size={18} /></div><span className="metric-label">{label}</span><strong className="metric-value">{value}</strong><span className="metric-detail">{detail}</span><div className="metric-spark" aria-hidden="true"><i /><i /><i /><i /><i /><i /><i /></div></article>
 }
 
-function Queue({ cases, details, query, filter, loading, view, onQuery, onFilter, onOpen, onDemo }: {
-  cases: CaseListItem[]; details: Record<number, CaseDetail>; query: string; filter: string; loading: boolean; view: View
+function Queue({ cases, totalCases, details, query, filter, loading, view, onQuery, onFilter, onOpen, onDemo }: {
+  cases: CaseListItem[]; totalCases: number; details: Record<number, CaseDetail>; query: string; filter: string; loading: boolean; view: View
   onQuery: (value: string) => void; onFilter: (value: string) => void; onOpen: (id: number) => void; onDemo: () => void
 }) {
   return <section className="panel queue-panel">
-    <div className="panel-heading queue-heading"><div><div className="panel-title-line"><h2>{view === 'operations' ? 'Disruption queue' : 'All cases'}</h2><span className="count-chip">{cases.length}</span></div><p>Cases from the local synthetic dataset</p></div><div className="queue-controls"><label className="search-box"><Icon name="search" size={16} /><span className="sr-only">Search cases</span><input value={query} onChange={(event) => onQuery(event.target.value)} placeholder="Search passenger, flight…" /></label><label className="filter-box"><Icon name="filter" size={15} /><span className="sr-only">Filter cases</span><select value={filter} onChange={(event) => onFilter(event.target.value)}><option value="all">All cases</option><option value="open">Open</option><option value="evaluated">Evaluated</option><option value="attention">Needs attention</option></select></label></div></div>
-    {loading ? <div className="loading-state"><span className="spinner" />Loading case data…</div> : cases.length === 0 ? <div className="empty-state"><div className="empty-icon"><Icon name="plane" size={22} /></div><h3>No disruption cases yet</h3><p>Trigger a synthetic flight cancellation to create cases from seeded demo bookings.</p><button className="button button-primary" type="button" onClick={onDemo}><Icon name="plus" size={16} />Trigger demo event</button></div> : <>
+    <div className="panel-heading queue-heading"><div><div className="panel-title-line"><h2>{view === 'operations' ? 'Disruption queue' : 'All cases'}</h2><span className="count-chip">{cases.length}</span></div><p>Cases from the local synthetic dataset</p></div><div className="queue-controls"><div className="search-box"><Icon name="search" size={16} /><label className="sr-only" htmlFor="case-search">Search cases</label><input id="case-search" value={query} onChange={(event) => onQuery(event.target.value)} placeholder="Search name, flight, PNR, case or airport…" />{query && <button className="search-clear" type="button" aria-label="Clear search" onClick={() => onQuery('')}><Icon name="close" size={14} /></button>}</div><label className="filter-box"><Icon name="filter" size={15} /><span className="sr-only">Filter cases</span><select value={filter} onChange={(event) => onFilter(event.target.value)}><option value="all">All cases</option><option value="open">Open</option><option value="evaluated">Evaluated</option><option value="attention">Needs attention</option></select></label></div></div>
+    {loading ? <div className="loading-state"><span className="spinner" />Loading case data…</div> : cases.length === 0 && totalCases === 0 ? <div className="empty-state"><div className="empty-icon"><Icon name="plane" size={22} /></div><h3>No disruption cases yet</h3><p>Trigger a synthetic flight cancellation to create cases from seeded demo bookings.</p><button className="button button-primary" type="button" onClick={onDemo}><Icon name="plus" size={16} />Trigger demo event</button></div> : cases.length === 0 ? <div className="empty-state"><div className="empty-icon"><Icon name="search" size={22} /></div><h3>No matching cases</h3><p>Try a different passenger, flight, PNR, case ID, or airport code.</p>{query && <button className="button button-secondary" type="button" onClick={() => onQuery('')}>Clear search</button>}</div> : <>
       <div className="queue-scroll"><div className="queue-table queue-table-head"><span>CASE / BOOKING</span><span>PASSENGER</span><span>DISRUPTION</span><span>RISK</span><span>STATUS</span><span>RECOMMENDATION</span><span /></div>
         <div className="queue-rows">{cases.map((item) => {
           const detail = details[item.id]
           const evaluation = detail?.latest_decision
           const connection = evaluation?.connection_assessments.find((entry) => entry.status !== 'feasible')
+          const eventStatus = detail?.audit_timeline.find((entry) => entry.action === 'flight_event_received')?.details.status
+          const disruptionLabel = eventStatus === 'cancel' ? 'Cancellation' : eventStatus === 'delay' ? 'Significant delay' : eventStatus === 'missed_connection' ? 'Missed connection' : 'Disruption'
           const risk = ['escalate', 'manual_review'].includes(evaluation?.decision_code || '') ? 'Review' : connection ? 'Elevated' : evaluation ? 'Screened' : 'Unassessed'
           return <button className="queue-table queue-row" type="button" key={item.id} onClick={() => onOpen(item.id)}>
             <span className="case-primary"><strong>CS-{String(item.id).padStart(4, '0')}</strong><small>{item.booking_ref || 'Booking unavailable'}</small></span>
             <span className="passenger-cell"><strong>{item.passenger_name || 'Passenger unavailable'}</strong><small>Passenger</small></span>
-            <span className="flight-cell"><i className="mini-flight"><Icon name="plane" size={13} /></i><span><strong>{item.flight_id || 'Flight unknown'}</strong><small>{detail?.event_id ? 'Cancellation' : 'Disruption'}</small></span></span>
+            <span className="flight-cell"><i className="mini-flight"><Icon name="plane" size={13} /></i><span><strong>{item.flight_id || 'Flight unknown'}</strong><small>{detail?.itinerary.find((leg) => leg.flight_id === item.flight_id)?.airline_name || 'Synthetic flight'} · {disruptionLabel}</small></span></span>
             <span><RiskTag risk={risk} /></span><span><Badge tone={item.status === 'open' ? 'blue' : 'slate'}>{item.status || 'Unknown'}</Badge></span>
             <span><Badge tone={decisionTone(evaluation?.decision_code)}>{decisionText(evaluation?.decision_code)}</Badge></span><span className="row-chevron"><Icon name="chevron" size={17} /></span>
           </button>
         })}</div>
-      </div><div className="queue-footer"><span>Showing {cases.length} case{cases.length === 1 ? '' : 's'}</span><span><i className="dataset-dot" />Synthetic records only</span></div>
+      </div><div className="queue-footer"><span>Showing {cases.length} of {totalCases} case{totalCases === 1 ? '' : 's'}</span><span><i className="dataset-dot" />Synthetic records only</span></div>
     </>}
   </section>
 }
@@ -423,7 +425,26 @@ function ProviderBadge({ metadata }: { metadata: CopilotMetadata | null }) {
 
 function EvidenceRefs({ items }: { items: string[] }) {
   if (!items.length) return null
-  return <div className="evidence-refs"><span>Evidence</span>{items.map((item) => <code key={item}>{item}</code>)}</div>
+  return <div className="evidence-refs"><span>Evidence</span>{items.map((item) => <code key={item} title={item}>{item.replaceAll('.', ' · ')}</code>)}</div>
+}
+
+function AgentValue({ value }: { value: unknown }) {
+  if (value === null) return <span className="agent-value-empty">Not provided</span>
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return <span>{String(value)}</span>
+  }
+  if (Array.isArray(value)) {
+    return value.length
+      ? <ul className="agent-value-list">{value.map((item, index) => <li key={index}><AgentValue value={item} /></li>)}</ul>
+      : <span className="agent-value-empty">None</span>
+  }
+  if (typeof value === 'object') {
+    const entries = Object.entries(value)
+    return entries.length
+      ? <dl className="agent-value-object">{entries.map(([key, item]) => <div key={key}><dt>{pretty(key)}</dt><dd><AgentValue value={item} /></dd></div>)}</dl>
+      : <span className="agent-value-empty">No details</span>
+  }
+  return <span className="agent-value-empty">Unavailable</span>
 }
 
 function EvidenceList({ title, items }: { title: string; items: { text: string; evidence_refs: string[] }[] }) {
@@ -436,13 +457,13 @@ function StringList({ title, items }: { title: string; items: string[] }) {
   return <div className="copilot-result-block"><strong>{title}</strong><ul>{items.map((item, index) => <li key={title + index}>{item}</li>)}</ul></div>
 }
 
-function CaseWorkspace({ detail, actions, draft, savedDraft, copilot, analysis, comparison, copilotAnswer, copilotQuestion, actionType, candidateId, busy, onBack, onRefresh, onEvaluate, onDraft, onDraftChange, onActionType, onCandidate, onPropose, onAnalyze, onCompare, onAsk, onQuestionChange, onApprove, onReject }: {
+function CaseWorkspace({ detail, actions, draft, savedDraft, copilot, analysis, agentRun, copilotAnswer, copilotQuestion, actionType, candidateId, busy, onBack, onRefresh, onEvaluate, onDraft, onDraftChange, onActionType, onCandidate, onPropose, onAnalyze, onRunAgent, onAsk, onQuestionChange, onApprove, onReject }: {
   detail: CaseDetail; actions: RecoveryAction[]; draft: string; savedDraft: string; copilot: CaseCopilotResponse | null
-  analysis: CopilotAnalysisResponse | null; comparison: CopilotComparisonResponse | null; copilotAnswer: CopilotAskResponse | null; copilotQuestion: string
+  analysis: CopilotAnalysisResponse | null; agentRun: AgentRunResponse | null; copilotAnswer: CopilotAskResponse | null; copilotQuestion: string
   actionType: ActionType; candidateId: string; busy: string
   onBack: () => void; onRefresh: () => void; onEvaluate: () => void; onDraft: () => void; onDraftChange: (value: string) => void
   onActionType: (value: ActionType) => void; onCandidate: (value: string) => void; onPropose: () => void
-  onAnalyze: () => void; onCompare: () => void; onAsk: () => void; onQuestionChange: (value: string) => void
+  onAnalyze: () => void; onRunAgent: () => void; onAsk: () => void; onQuestionChange: (value: string) => void
   onApprove: (action: RecoveryAction) => void; onReject: (action: RecoveryAction) => void
 }) {
   const decision = detail.latest_decision
@@ -461,8 +482,8 @@ function CaseWorkspace({ detail, actions, draft, savedDraft, copilot, analysis, 
     <div className="detail-heading"><div><div className="eyebrow">CASE WORKSPACE <span className="eyebrow-line" /></div><div className="detail-title-row"><h1>Case #{String(detail.id).padStart(4, '0')}</h1><Badge tone="blue">{detail.status || 'Unknown status'}</Badge></div><p>{detail.booking_ref || 'Booking unavailable'} · {detail.passenger_name || 'Passenger unavailable'} · Opened {dateLabel(detail.created_at)}</p></div><button className="button button-primary" onClick={onEvaluate} type="button" disabled={busy === 'evaluate'}><Icon name="route" size={16} />{busy === 'evaluate' ? 'Evaluating…' : decision ? 'Re-evaluate case' : 'Evaluate case'}</button></div>
     <div className="detail-grid">
       <div className="detail-main-column">
-        <section className="panel overview-panel"><div className="section-heading"><div><span className="section-kicker">DISRUPTION OVERVIEW</span><h2>Affected journey</h2></div><Badge tone="amber">{receivedEvent?.details.status === 'cancel' ? 'Flight cancellation' : 'Flight disruption'}</Badge></div><div className="overview-data">
-          <div className="overview-cell"><span>AFFECTED FLIGHT</span><strong><Icon name="plane" size={17} />{detail.flight_id || 'Unavailable'}</strong><small>Event {detail.event_id || 'not available'}</small></div>
+        <section className="panel overview-panel"><div className="section-heading"><div><span className="section-kicker">DISRUPTION OVERVIEW</span><h2>Affected journey</h2></div><Badge tone="amber">{detail.disruption_reason || (receivedEvent?.details.status === 'cancel' ? 'Flight cancellation' : 'Flight disruption')}</Badge></div><div className="overview-data">
+          <div className="overview-cell"><span>AFFECTED FLIGHT</span><strong><Icon name="plane" size={17} />{detail.flight_id || 'Unavailable'}</strong><small>{detail.itinerary.find((leg) => leg.flight_id === detail.flight_id)?.airline_name || 'Synthetic flight'} · Event {detail.event_id || 'not available'}</small></div>
           <div className="overview-cell"><span>BOOKING REFERENCE</span><strong>{detail.booking_ref || 'Unavailable'}</strong><small>{detail.passenger_name || 'Passenger not provided'}</small></div>
           <div className="overview-cell"><span>CASE CREATED</span><strong><Icon name="calendar" size={16} />{dateLabel(detail.created_at, { month: 'short', day: 'numeric', year: 'numeric' })}</strong><small>{dateLabel(detail.created_at, { hour: 'numeric', minute: '2-digit' })}</small></div>
         </div></section>
@@ -497,7 +518,21 @@ function CaseWorkspace({ detail, actions, draft, savedDraft, copilot, analysis, 
           </div></div> : <div className="no-action-note"><Icon name="shield" size={15} />{decision ? 'No action is eligible under this saved decision.' : 'Evaluate the case before proposing an action.'}</div>}
         </section>
 
-        <section className="panel copilot-panel"><div className="section-heading"><div className="copilot-heading"><span className="copilot-mark"><Icon name="spark" size={16} /></span><div><span className="section-kicker">CASE COPILOT</span><h2>AI-assisted case review</h2></div></div><ProviderBadge metadata={analysis?.metadata || comparison?.metadata || copilotAnswer?.metadata || copilot?.metadata || null} /></div><p className="copilot-description">Advisory summaries use this case’s persisted evidence. Deterministic policy controls eligibility. Generated content never proposes or executes actions.</p>
+        <section className="panel copilot-panel"><div className="section-heading"><div className="copilot-heading"><span className="copilot-mark"><Icon name="spark" size={16} /></span><div><span className="section-kicker">CASE COPILOT</span><h2>AI-assisted case review</h2></div></div><ProviderBadge metadata={analysis?.metadata || copilotAnswer?.metadata || copilot?.metadata || null} /></div><p className="copilot-description">Advisory summaries use this case’s persisted evidence. Deterministic policy controls eligibility. Generated content never proposes or executes actions.</p>
+          <div className="copilot-tool-row"><div><strong>Bounded recovery agent</strong><small>Uses read-only tools to inspect persisted synthetic options and connection checks. No proposal permission is granted.</small></div><button className="button button-secondary" type="button" onClick={onRunAgent} disabled={busy === 'agent-run'}><Icon name="route" size={15} />{busy === 'agent-run' ? 'Running agent…' : 'Run AI Recovery Agent'}</button></div>
+          {busy === 'agent-run' && <div className="agent-loading" role="status"><span className="spinner" />Running bounded analysis against persisted case evidence…</div>}
+          {agentRun && <div className="copilot-result agent-result" aria-live="polite">
+            <div className="copilot-result-heading"><strong>Recovery agent result</strong><div className="provider-result-meta"><ProviderBadge metadata={agentRun.metadata} /><Badge tone="slate">{agentRun.simulated ? 'Simulated' : 'Unverified'}</Badge></div></div>
+            <p>{agentRun.summary}</p>
+            <div className="agent-safety-note"><Icon name="shield" size={14} />{agentRun.approval_required ? 'Human approval remains required for any proposed action.' : 'No approval was requested.'} This run cannot approve, reject, or execute actions.</div>
+            {agentRun.proposed_action_id && <div className="agent-proposal-note" role="status">Proposal {agentRun.proposed_action_id} is separate from this run and requires human approval in Proposed actions.</div>}
+            <div className="copilot-result-block"><strong>Tool results</strong>
+              {agentRun.tool_results.length === 0 ? <p className="agent-empty">The agent returned no tool results for this run.</p> : <div className="agent-tool-results">{agentRun.tool_results.map((item, index) => <section className="agent-tool-result" key={item.name + '-' + index}>
+                <div className="agent-tool-heading"><strong>{pretty(item.name)}</strong><Badge tone={item.status === 'completed' ? 'green' : item.status === 'blocked' ? 'amber' : 'red'}>{pretty(item.status)}</Badge></div>
+                <AgentValue value={item.result} />
+              </section>)}</div>}
+            </div>
+          </div>}
           <div className="copilot-tool-row"><div><strong>Structured recovery analysis</strong><small>Summarize confirmed facts, risks, evidence and next steps.</small></div><button className="button button-secondary" type="button" onClick={onAnalyze} disabled={busy === 'copilot-analysis'}><Icon name="spark" size={15} />{busy === 'copilot-analysis' ? 'Analyzing…' : analysis ? 'Refresh analysis' : 'Analyze case'}</button></div>
           {analysis && <div className="copilot-result" aria-live="polite"><div className="copilot-result-heading"><strong>{analysis.analysis_status === 'complete' ? 'Analysis' : 'Limited analysis'}</strong><div className="provider-result-meta"><Badge tone={analysis.analysis_status === 'complete' ? 'blue' : 'amber'}>{pretty(analysis.analysis_status)}</Badge><ProviderBadge metadata={analysis.metadata} /></div></div><p>{analysis.disruption_summary}</p>
             <EvidenceList title="Confirmed facts" items={analysis.confirmed_facts} /><EvidenceList title="Risk findings" items={analysis.risk_findings} />
@@ -506,8 +541,6 @@ function CaseWorkspace({ detail, actions, draft, savedDraft, copilot, analysis, 
             {analysis.missing_information.length > 0 && <StringList title="Missing information" items={analysis.missing_information} />}
             <div className="copilot-result-block"><strong>Suggested next step</strong><p>{analysis.recommended_next_step}</p></div><EvidenceRefs items={analysis.evidence_refs} />
           </div>}
-          <div className="copilot-tool-row"><div><strong>Alternative comparison</strong><small>Compare only alternatives already eligible in the saved deterministic decision.</small></div><button className="button button-secondary" type="button" onClick={onCompare} disabled={busy === 'copilot-compare' || !decision?.candidates.length}><Icon name="route" size={15} />{busy === 'copilot-compare' ? 'Comparing…' : 'Compare eligible options'}</button></div>
-          {comparison && <div className="copilot-result" aria-live="polite"><div className="copilot-result-heading"><strong>Eligible simulated options</strong><ProviderBadge metadata={comparison.metadata} /></div>{comparison.options.map((option) => <div className="option-comparison" key={option.inventory_id}><div className="comparison-title"><strong>{option.inventory_id}</strong><span>{option.summary}</span></div><EvidenceList title="Pros" items={option.pros} /><EvidenceList title="Cons" items={option.cons} /><EvidenceList title="Connection risks" items={option.connection_risks} />{option.known_unknowns.length > 0 && <StringList title="Known unknowns" items={option.known_unknowns} />}<EvidenceRefs items={option.evidence_refs} /></div>)}<div className="copilot-result-block"><strong>Policy ranking explanation</strong><p>{comparison.policy_ranking_explanation}</p></div><EvidenceRefs items={comparison.evidence_refs} /><small className="simulation-caption">All options and availability shown here are simulated. This comparison does not change eligibility or policy ranking.</small></div>}
           <div className="copilot-tool-row"><div><strong>Ask about this case</strong><small>Answers are limited to the case, evaluation, action and audit evidence.</small></div></div>
           <form className="copilot-ask-form" onSubmit={(event) => { event.preventDefault(); onAsk() }}><label className="field-label" htmlFor="copilot-question">Your question</label><textarea id="copilot-question" value={copilotQuestion} onChange={(event) => onQuestionChange(event.target.value)} rows={2} maxLength={1000} placeholder="Why was this case escalated?" /><button className="button button-secondary" type="submit" disabled={busy === 'copilot-ask' || !copilotQuestion.trim()}>{busy === 'copilot-ask' ? 'Answering…' : 'Ask about this case'}</button></form>
           {copilotAnswer && <div className="copilot-answer" aria-live="polite"><div className="copilot-result-heading"><strong>Case answer</strong><ProviderBadge metadata={copilotAnswer.metadata} /></div><p>{copilotAnswer.answer}</p><EvidenceRefs items={copilotAnswer.evidence_refs} />{copilotAnswer.missing_information.length > 0 && <StringList title="Information not available" items={copilotAnswer.missing_information} />}</div>}
@@ -600,7 +633,7 @@ function ConfirmDialog({ kind, action, busy, onCancel, onConfirm }: { kind: 'app
 }
 
 function DemoDialog({ busy, onClose, onSubmit }: { busy: boolean; onClose: () => void; onSubmit: (flightId: string) => void }) {
-  const [flightId, setFlightId] = useState('FL-1001')
+  const [flightId, setFlightId] = useState('DEMO-AI-2101')
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose() }
     window.addEventListener('keydown', closeOnEscape)
@@ -609,7 +642,7 @@ function DemoDialog({ busy, onClose, onSubmit }: { busy: boolean; onClose: () =>
   return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><section className="confirm-modal demo-modal" role="dialog" aria-modal="true" aria-labelledby="demo-title">
     <button className="icon-button modal-close" aria-label="Close demo event" onClick={onClose} type="button"><Icon name="close" /></button><div className="modal-icon modal-icon-teal"><Icon name="plane" size={21} /></div><span className="section-kicker">SYNTHETIC WEBHOOK</span><h2 id="demo-title">Trigger a flight alert</h2>
     <p>This sends a supported cancellation event to the local demo API. Matching synthetic bookings receive new cases. Repeating this intentionally creates another event and case set.</p>
-    <label className="field-label demo-field">Flight identifier<input autoFocus value={flightId} onChange={(event) => setFlightId(event.target.value)} placeholder="FL-1001" /></label>
+    <label className="field-label demo-field">Flight identifier<input autoFocus value={flightId} onChange={(event) => setFlightId(event.target.value)} placeholder="DEMO-AI-2101" /></label>
     <div className="event-preview"><span>EVENT PAYLOAD</span><code>{'{"event_id":"evt-demo-[unique]","fid":"' + (flightId || '…') + '","changes":{"status":"cancel"}}'}</code></div>
     <div className="modal-buttons"><button className="button button-secondary" type="button" onClick={onClose} disabled={busy}>Cancel</button><button className="button button-primary" type="button" onClick={() => onSubmit(flightId)} disabled={busy || !flightId.trim()}><Icon name="send" size={15} />{busy ? 'Sending event…' : 'Send synthetic event'}</button></div>
   </section></div>
