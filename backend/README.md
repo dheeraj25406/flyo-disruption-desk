@@ -72,6 +72,8 @@ Configuration is read from the backend process environment; the application does
 
 `GEMINI_API_KEY` is optional. `DATABASE_URL` is also read from the process environment; by default the backend uses SQLite. Keep actual credentials out of logs, API responses, and Git.
 
+Set `CORS_ORIGINS` in the backend process environment to a comma-separated list of exact deployed frontend origins, such as `https://your-app.vercel.app`. Entries are trimmed and empty values ignored. The two local development origins (`http://localhost:5173` and `http://127.0.0.1:5173`) remain allowed. Wildcard origins are rejected.
+
 ## API routes
 
 The current endpoints are `GET /health`, `POST /webhooks/flight-alerts`, `GET /cases`, `GET /cases/{case_id}`, `POST /cases/{case_id}/evaluate`, `POST /cases/{case_id}/copilot/analyze`, `POST /cases/{case_id}/copilot/ask`, `POST /cases/{case_id}/agent/run`, `POST /cases/{case_id}/actions`, `GET /actions/{action_id}`, `POST /actions/{action_id}/approve`, `POST /actions/{action_id}/reject`, and `POST /cases/{case_id}/draft-message`. There is no dedicated Copilot comparison endpoint.

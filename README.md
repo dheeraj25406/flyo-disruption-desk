@@ -26,6 +26,8 @@ The backend creates its SQLite tables and synthetic seed data on startup. Its de
 
 On startup, the backend adds 25 namespaced synthetic Indian disruption cases, with fictional passenger/booking data and `DEMO-` flight identifiers. Seeding is repeatable and adds missing demo records without resetting existing database rows. The dashboard loads all cases from the backend API and searches passenger name, flight ID, PNR, case ID, and itinerary airport codes.
 
+For a deployed frontend, set `CORS_ORIGINS` in the Render backend process environment to a comma-separated list of exact frontend origins, for example `https://your-app.vercel.app`. Whitespace and empty entries are ignored. The local Vite origins `http://localhost:5173` and `http://127.0.0.1:5173` are always allowed; wildcard origins are rejected.
+
 ### Configure Gemini (optional)
 
 The backend reads `GEMINI_API_KEY`, `GEMINI_MODEL`, `GEMINI_TIMEOUT_SECONDS`, and `GEMINI_MAX_OUTPUT_TOKENS` from the process environment. It does not load `.env` files. `.env.example` is a placeholder/reference only; supplying values to the shell that starts Uvicorn is required. For example, from the repository root in a POSIX shell:
